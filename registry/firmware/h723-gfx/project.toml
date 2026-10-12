@@ -1,0 +1,3 @@
+name        = "H723 GFX Firmware"
+chip        = "stm32h723"
+description = "[baram]님의 TouchGFX 프로젝트"
