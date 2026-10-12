@@ -1,0 +1,7 @@
+# ESP target, programmed over UART by HG-SWD-PROG (esp_project.c, prepare_esp_sd.py).
+kind         = "esp"
+name         = "ESP32-C3"
+family       = "ESP32"
+device       = "ESP32-C3"       # fw.txt device=
+chip_id      = 5               # image header chip ID
+boot_address = 0x0000          # bootloader.bin; partitions.bin 0x8000, firmware.bin 0x10000

@@ -6,18 +6,25 @@
 
 ```text
 registry/firmware/
-└── h723-gfx/                 프로젝트 ID = SD의 /prog/fw/<ID>/ 폴더명
+├── h723/                     프로젝트 ID = SD의 /prog/fw/<ID>/ 폴더명
+│   ├── project.toml
+│   └── 1.0.0/                버전 (x.y.z 또는 x.y.z-rc.1)
+│       ├── release.toml
+│       └── app.bin           STM32: 이미지 하나
+└── esp32s3-rly4-pro/
     ├── project.toml
-    └── 1.0.0/                버전 (x.y.z 또는 x.y.z-rc.1)
+    └── 1.0.0/
         ├── release.toml
-        └── app.bin
+        ├── bootloader.bin    ESP: 이름이 정해진 세 파일
+        ├── partitions.bin
+        └── firmware.bin      ota-reset.bin은 넣지 않음 (CI가 생성)
 ```
 
 `project.toml`
 
 ```toml
 name        = "H723 GFX firmware"   # fw.txt name, 출력 가능한 ASCII 1~47자
-chip        = "stm32h723"           # registry/chips/<chip>.toml
+chip        = "stm32h723"           # registry/chips/<chip>.toml: stm32h723, esp32, esp32s3, esp32c3
 description = "H723 그래픽 데모"     # 사이트 표시용, 한글 가능
 ```
 
@@ -25,7 +32,8 @@ description = "H723 그래픽 데모"     # 사이트 표시용, 한글 가능
 
 ```toml
 date  = 2026-10-12      # 따옴표 없는 TOML 날짜
-image = "app.bin"       # 생략하면 app.bin
+image = "app.bin"       # STM32만. 생략하면 app.bin
+baud  = "auto"          # ESP만. auto(921600부터 검사), 921600, 460800, 230400, 115200
 notes = """
 - 변경 내용
 """
@@ -34,7 +42,8 @@ notes = """
 ## 규칙
 
 - 프로젝트 ID는 영문·숫자·`_`·`-` 1~24자입니다. 프로그래머가 표시하는 폴더명 규칙과 같습니다.
-- BIN은 칩 Flash 시작 주소(H723은 `0x08000000`)의 벡터 테이블부터 시작하는 전체 이미지여야 합니다. 초기 SP와 Reset 벡터를 검사합니다.
+- STM32 BIN은 칩 Flash 시작 주소(H723은 `0x08000000`)의 벡터 테이블부터 시작하는 전체 이미지여야 합니다. 초기 SP와 Reset 벡터를 검사합니다.
+- ESP는 빌드 결과의 `bootloader.bin`, `partitions.bin`, `firmware.bin`을 이름 그대로 넣습니다. 기록 주소는 칩이 정합니다. ESP32는 부트로더 `0x1000`, S3·C3는 `0x0`이고, 파티션 표 `0x8000`, 앱 `0x10000`입니다.
 - 이미지 `0x400`에 `VER ` 헤더가 있으면 내장 버전과 이름을 읽어 사이트에 표시합니다.
 - 이미 게시한 버전 폴더는 고치지 말고 새 버전을 추가합니다. 기기는 버전 문자열로 변경 여부를 판단합니다.
 - 올리기 전에 로컬에서 `python tools/build_registry.py --check`로 검사할 수 있습니다.

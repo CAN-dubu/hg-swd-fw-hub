@@ -19,19 +19,32 @@
         </svg>
         <span>HG-SWD <b>FW Hub</b></span>
       </a>
-      <nav class="nav">
-        <a href="#/">펌웨어</a>
-        <a href="#/sd">SD 준비</a>
-        <a href="#/api">기기 API</a>
-        <a href="#/upload">등록</a>
-        <a href="https://github.com/CAN-dubu/hg-swd-fw-hub" target="_blank" rel="noopener">GitHub</a>
-      </nav>
+      <div class="top-actions">
+        <nav class="nav">
+          <a href="#/">펌웨어</a>
+          <a href="#/sd">SD 준비</a>
+          <a href="#/api">기기 API</a>
+          <a href="#/upload">등록</a>
+          <a href="https://github.com/CAN-dubu/hg-swd-fw-hub" target="_blank" rel="noopener">GitHub</a>
+        </nav>
+        <button id="refresh" class="icon-btn" type="button" title="새로고침: 새로 등록된 펌웨어 확인" aria-label="새로고침">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.3-4.9L4 8"/><path d="M4 3v5h5"/><path d="M4 13a8 8 0 0 0 14.3 4.9L20 16"/><path d="M20 21v-5h-5"/></svg>
+        </button>
+      </div>
     </div>
   </header>
 
-  <main id="app" class="wrap" aria-live="polite">
-    <p class="loading">불러오는 중…</p>
+  <main id="app" class="wrap" aria-live="polite" aria-busy="true">
+    <div class="skeleton" aria-label="불러오는 중">
+      <div class="sk sk-eyebrow"></div>
+      <div class="sk sk-title"></div>
+      <div class="sk sk-line"></div>
+      <div class="sk sk-line short"></div>
+      <div class="sk-stats"><div class="sk sk-stat"></div><div class="sk sk-stat"></div><div class="sk sk-stat"></div></div>
+      <div class="grid"><div class="sk sk-card"></div><div class="sk sk-card"></div><div class="sk sk-card"></div></div>
+    </div>
   </main>
+  <div id="toasts" aria-live="polite"></div>
 
   <footer class="wrap footer">
     <span>made by Higenis</span>
@@ -45,8 +58,8 @@
       <div class="cols">
         <ol class="steps">
           <li><b>SD 패키지(zip)</b>를 받아 <code>prog</code> 폴더를 카드 루트에 풉니다. 같은 프로젝트의 이전 버전은 덮어씁니다.</li>
-          <li>카드에 로더가 없다면 아래 로더 파일을 직접 복사합니다. ST 라이선스 때문에 패키지에 포함하지 않습니다.</li>
-          <li>카드를 프로그래머에 꽂고 홈의 <b>Flash</b>에서 프로젝트를 선택합니다.</li>
+          <li><b>STM32(H723) 프로젝트</b>는 카드에 로더가 있어야 합니다. 없다면 아래 로더 파일을 직접 복사합니다. ST 라이선스 때문에 패키지에 포함하지 않습니다. <b>ESP 프로젝트</b>는 로더가 필요 없습니다.</li>
+          <li>카드를 프로그래머에 꽂고 메뉴(M)의 <b>Flash</b>에서 프로젝트를 고릅니다. 반복 작업은 <b>Auto setup</b>에서 칩별 프로젝트를 지정해 두고 대기 화면에서 SEL만 누릅니다.</li>
           <li>확인 화면에서 SEL을 놓았다가 1초 누릅니다. <code>Verified</code>가 표시되면 완료입니다.</li>
         </ol>
         <pre class="tree">/prog/
@@ -54,9 +67,16 @@
 │   └── st/
 │       └── 0x483.stldr     <span>← 직접 복사</span>
 ├── fw/
-│   └── &lt;프로젝트 ID&gt;/
+│   ├── &lt;STM32 프로젝트&gt;/
+│   │   ├── fw.txt
+│   │   └── app.bin
+│   └── &lt;ESP 프로젝트&gt;/
 │       ├── fw.txt
-│       └── app.bin
+│       ├── bootloader.bin
+│       ├── partitions.bin
+│       ├── ota-reset.bin
+│       └── firmware.bin
+├── auto0.cfg / auto1.cfg <span>← 프로그래머가 관리</span>
 └── README.txt</pre>
       </div>
       <h2>로더</h2>
@@ -71,7 +91,7 @@
       <div class="endpoints">
         <article class="endpoint">
           <header><span class="method">GET</span><code data-url="fw/&lt;id&gt;/latest.txt"></code></header>
-          <p>프로젝트의 최신 정식 버전입니다. 프리릴리스는 제외됩니다. <code>fw.txt</code>와 같은 <code>key=value</code> 형식이라 펌웨어의 기존 파서로 읽을 수 있습니다. 경로는 사이트 루트 기준입니다.</p>
+          <p>프로젝트의 최신 정식 버전입니다. 프리릴리스는 제외됩니다. <code>fw.txt</code>와 같은 <code>key=value</code> 형식입니다. <code>file=이름,크기,CRC32,SHA-256</code> 줄마다 <code>base</code> + 이름으로 받습니다. STM32는 파일 2개, ESP는 5개이며, <code>fw.txt</code>가 항상 마지막입니다.</p>
           <pre id="latest-sample" class="code"></pre>
         </article>
         <article class="endpoint">
@@ -79,15 +99,15 @@
           <p>칩, 로더, 프로젝트, 전체 버전 목록입니다. 이 사이트도 같은 파일을 렌더링합니다. <code>schema</code>가 바뀌면 호환되지 않는 변경입니다.</p>
         </article>
         <article class="endpoint">
-          <header><span class="method">GET</span><code data-url="fw/&lt;id&gt;/&lt;version&gt;/{app.bin, fw.txt}"></code></header>
-          <p>버전 폴더는 게시한 뒤 바뀌지 않습니다. 받은 BIN은 <code>size</code>, <code>crc32</code>, <code>sha256</code>로 검증한 다음 SD에 반영합니다.</p>
+          <header><span class="method">GET</span><code data-url="fw/&lt;id&gt;/&lt;version&gt;/&lt;file&gt;"></code></header>
+          <p>버전 폴더는 게시한 뒤 바뀌지 않습니다. 받은 파일은 크기, CRC32, SHA-256으로 검증한 다음 SD에 반영합니다.</p>
         </article>
       </div>
       <h2>권장 업데이트 순서</h2>
       <ol class="steps">
         <li><code>latest.txt</code>를 받아 SD의 현재 버전과 비교합니다.</li>
-        <li>새 BIN과 <code>fw.txt</code>를 <code>/prog/.staging/&lt;id&gt;/</code>에 받습니다.</li>
-        <li>크기, CRC32, SHA-256을 확인합니다. 하나라도 다르면 버립니다.</li>
+        <li><code>file=</code> 줄의 파일을 차례로 <code>/prog/.staging/&lt;id&gt;/</code>에 받습니다. <code>fw.txt</code>는 마지막에 씁니다.</li>
+        <li>파일마다 크기, CRC32, SHA-256을 확인합니다. 하나라도 다르면 전부 버립니다.</li>
         <li>기존 폴더를 백업 이름으로 바꾸고, staging 폴더를 <code>/prog/fw/&lt;id&gt;/</code>로 바꿉니다. 기록 작업 중에는 교체하지 않습니다.</li>
       </ol>
     </section>
