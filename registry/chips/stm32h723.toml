@@ -1,0 +1,16 @@
+# STM32H723ZGT6 internal flash target, as checked by HG-SWD-PROG prog_inspect.c.
+name        = "STM32H723ZGT6"
+family      = "STM32H7"
+device      = "STM32H72x/STM32H73x"   # fw.txt device=
+loader      = "st-0x483"
+flash_base  = 0x08000000
+flash_size  = 0x00100000
+sector_size = 0x00020000
+
+# The initial SP must lie in one of these (start, end] ranges and be 8-byte aligned.
+ram = [
+  [0x20000000, 0x20020000],  # DTCM
+  [0x24000000, 0x24050000],  # AXI SRAM
+  [0x30000000, 0x30008000],  # SRAM1/2
+  [0x38000000, 0x38004000],  # SRAM4
+]

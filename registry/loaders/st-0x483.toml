@@ -1,0 +1,11 @@
+# ST flash loader pinned by HG-SWD-PROG (prog.c LOADER_CRC).
+# The file belongs to STM32CubeProgrammer and is not redistributed here (hosted = false):
+# users copy it from their own CubeCLT/CubeProgrammer install and check it against these values.
+# Set hosted = true and place the file next to this one only if redistribution is permitted.
+name    = "ST 0x483 (STM32H72x/H73x internal flash)"
+sd_path = "/prog/loaders/st/0x483.stldr"
+size    = 20748
+crc32   = 0x32674EA9
+sha256  = "639a988e15f5e1adebd2939ff79510e759389cbfe41ea4cacc5b961ce491838c"
+source  = "STM32CubeCLT 1.20.0: STM32CubeProgrammer/bin/FlashLoader/0x483.stldr"
+hosted  = false
