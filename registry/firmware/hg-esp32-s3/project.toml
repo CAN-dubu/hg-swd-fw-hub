@@ -1,0 +1,3 @@
+name        = "HG ESP32S3 - test firmware"
+chip        = "esp32s3"
+description = "hg esp32s3 보드를 출고하기전 테스트를 할 수 있는 펌웨어"
