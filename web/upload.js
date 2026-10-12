@@ -355,334 +355,530 @@ const repoPath = `/repos/${REPO.owner}/${REPO.name}`;
 const encPath = (p) => p.split('/').map(encodeURIComponent).join('/');
 const existsOnBase = (token, path) => gh(token, 'GET', `${repoPath}/contents/${encPath(path)}?ref=${REPO.base}`, null, true).then(Boolean);
 
-/* ---------- 화면 ---------- */
+/* ---------- 화면: 세 가지를 고르고(칩 → 프로젝트 → 파일) 확인하면 PR ---------- */
+
+const NEW_PROJECT = '\u0000new';
+
+const ICONS = {
+  chip: '<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2.5v3.5M15 2.5v3.5M9 18v3.5M15 18v3.5M2.5 9h3.5M2.5 15h3.5M18 9h3.5M18 15h3.5"/>',
+  folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  file: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+  check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+  alert: '<path d="M12 8v5M12 16.5v.5"/><circle cx="12" cy="12" r="9"/>',
+  upload: '<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
+  chevron: '<path d="M9 6l6 6-6 6"/>',
+};
+
+function icon(name, cls = 'ico') {
+  const s = h('span', { class: cls, 'aria-hidden': 'true' });
+  s.innerHTML = `<svg viewBox="0 0 24 24">${ICONS[name]}</svg>`; // 고정 문자열만 넣는다
+  return s;
+}
+
+/* replaceChildren은 null을 글자로 넣으므로 빈 칸을 걸러서 채운다 */
+const put = (el, ...kids) => el.replaceChildren(...kids.flat(Infinity).filter((k) => k != null && k !== false));
+
+/* 열고 닫을 때 부드럽게 움직이는 모달. close()는 애니메이션이 끝난 뒤 제거한다 */
+function openModal(title, { body, footer, wide, locked, onClose } = {}) {
+  const box = h('div', { class: 'modal-box' });
+  const dlg = h('dialog', { class: 'modal' + (wide ? ' wide' : '') }, box);
+  const m = {
+    dlg, locked: !!locked,
+    set(b, f) {
+      put(box,
+        h('header', { class: 'modal-head' }, h('h2', {}, title),
+          m.locked ? null : h('button', { class: 'modal-x', type: 'button', 'aria-label': '닫기', onclick: () => m.close() }, '✕')),
+        h('div', { class: 'modal-body' }, b),
+        f ? h('footer', { class: 'modal-foot' }, f) : null);
+    },
+    close() {
+      if (!dlg.open || dlg.classList.contains('closing')) return;
+      dlg.classList.add('closing');
+      setTimeout(() => { dlg.close(); dlg.remove(); onClose?.(); }, reduceMotion() ? 0 : 170);
+    },
+  };
+  m.set(body, footer);
+  dlg.addEventListener('cancel', (e) => { e.preventDefault(); if (!m.locked) m.close(); });
+  dlg.addEventListener('mousedown', (e) => { if (e.target === dlg && !m.locked) m.close(); }); // 바깥 클릭
+  document.body.append(dlg);
+  dlg.showModal();
+  return m;
+}
+
+/* 파일을 놓는 칸. multiple이면 여러 파일을 한 번에 받는다 */
+function dropZone(onFiles, { multiple = false, title, hint } = {}) {
+  const input = h('input', { type: 'file', accept: '.bin,application/octet-stream', multiple: multiple || null,
+    // 읽기 전에 value를 비우면 Chrome이 파일 접근을 거둘 수 있어 그대로 둔다 (읽은 뒤 칸을 다시 그림)
+    onchange: (e) => { if (e.target.files.length) onFiles([...e.target.files]); } });
+  const z = h('label', {
+    class: 'drop',
+    ondragover: (e) => { e.preventDefault(); z.classList.add('over'); },
+    ondragleave: () => z.classList.remove('over'),
+    ondrop: (e) => { e.preventDefault(); z.classList.remove('over'); const f = [...e.dataTransfer.files]; if (f.length) onFiles(multiple ? f : f.slice(0, 1)); },
+  }, input, icon('upload', 'drop-ico'), h('span', { class: 'drop-main' }, title), h('span', { class: 'drop-sub' }, hint));
+  return z;
+}
+
+/* 파일 이름으로 ESP 칸을 고른다. 한 번에 여러 파일을 놓을 때 쓴다 */
+function espSlotFor(name) {
+  const n = name.toLowerCase();
+  if (n.includes('ota')) return null; // ota-reset.bin은 CI가 만든다
+  if (n.includes('boot')) return 'bootloader.bin';
+  if (n.includes('partition')) return 'partitions.bin';
+  return 'firmware.bin';
+}
+
+function planUpload() {
+  const m = state.manifest;
+  const chip = up.chip ? chipOf(up.chip) : null;
+  const esp = chip?.kind === 'esp';
+  const isNew = up.project === NEW_PROJECT;
+  const proj = !isNew && up.project ? m.projects.find((p) => p.id === up.project) || null : null;
+  const errors = {};
+  const err = (k, msg) => { errors[k] = errors[k] || msg; };
+  const pid = proj ? proj.id : up.id.trim();
+  const pname = proj ? proj.name : up.name;
+  const ver = up.version.trim();
+
+  if (!chip) err('chip', '칩을 고르세요');
+  if (!proj && !isNew) err('project', '프로젝트를 고르세요');
+  if (isNew) {
+    if (!ID_RE.test(pid)) err('id', '영문·숫자·_·- 1~24자');
+    else if (m.projects.some((p) => p.id.toLowerCase() === pid.toLowerCase())) err('id', '이미 있는 ID입니다 (SD는 대소문자를 구분하지 않음)');
+    if (!NAME_RE.test(pname) || pname !== pname.trim()) err('name', '영문·숫자 등 ASCII 1~47자');
+    if (errors.id || errors.name) err('project', '새 프로젝트 정보를 확인하세요');
+  }
+  if (!VERSION_RE.test(ver)) err('version', 'x.y.z 형식 (예: 1.0.0)');
+  else if (proj?.versions.some((v) => v.version === ver)) err('version', '이미 게시된 버전입니다');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(up.date)) err('date', '날짜를 고르세요');
+
+  const empty = { checks: [], slotChecks: {}, images: [], fwTxt: null, error: '파일을 고르세요', embedded: null, upload: [] };
+  const pkg = chip ? (esp ? planEsp : planStm32)(chip, errors.name || !pname ? null : pname) : empty;
+  if (pkg.error) err('image', pkg.error);
+  if (pkg.fwTxt && pkg.fwTxt.length > 1024) err('image', 'fw.txt가 1,024바이트를 넘습니다');
+
+  const dir = `registry/firmware/${pid || '<ID>'}`;
+  const vdir = `${dir}/${ver || '<버전>'}`;
+  const notes = up.notes.trim();
+  const files = [];
+  if (isNew) files.push([`${dir}/project.toml`,
+    `name        = ${tomlString(pname)}\nchip        = ${tomlString(chip?.id || '')}\ndescription = ${tomlString(up.desc.trim())}\n`]);
+  files.push([`${vdir}/release.toml`, `date  = ${up.date}\n` + (esp ? `baud  = "${up.baud}"\n` : '') + (notes ? `notes = ${tomlString(notes, true)}\n` : '')]);
+  files.push(...pkg.upload.map(([name, bytes]) => [`${vdir}/${name}`, bytes]));
+  return { chip, esp, proj, isNew, pid, pname, ver, errors, pkg, files };
+}
+
+const selectionReady = (p) => !p.errors.chip && !p.errors.project && !p.errors.image;
+
+function resetUpload(keepToken = true) {
+  Object.assign(up, { chip: '', project: '', id: '', name: '', desc: '', image: null, esp: {}, baud: 'auto', version: '', notes: '',
+    date: new Date().toLocaleDateString('sv-SE') });
+  if (!keepToken) up.token = loadToken();
+}
 
 function renderUpload() {
   const m = state.manifest;
-  if (!m.chips.some((c) => c.id === up.chip)) up.chip = (m.chips.find((c) => c.kind !== 'esp') || m.chips[0])?.id || '';
   if (!up.date) up.date = new Date().toLocaleDateString('sv-SE');
   if (up.token === null) up.token = loadToken();
-  const el = { slots: {} };
+  if (up.chip && !m.chips.some((c) => c.id === up.chip)) resetUpload();
 
-  const errSpan = (key) => (el[`err_${key}`] = h('span', { class: 'err' }));
-  const field = (label, control, key, opts = {}) =>
-    (el[`f_${key}`] = h('label', { class: 'field' + (opts.wide ? ' wide' : '') },
-      h('span', { class: 'field-label' }, label), control, opts.hint ? h('span', { class: 'hint' }, opts.hint) : null, errSpan(key)));
-  const bind = (key, tag, attrs = {}, children = []) => {
-    const c = h(tag, { ...attrs, [tag === 'select' ? 'onchange' : 'oninput']: (e) => { up[key] = e.target.value; update(); } }, children);
-    c.value = up[key];
-    return (el[key] = c);
-  };
-  const dropZone = (onFile, accept = '.bin,application/octet-stream') => {
-    const z = { input: h('input', { type: 'file', accept, onchange: (e) => e.target.files[0] && onFile(e.target.files[0]) }),
-      main: h('span', { class: 'drop-main' }), sub: h('span', { class: 'drop-sub' }) };
-    z.label = h('label', {
-      class: 'drop',
-      ondragover: (e) => { e.preventDefault(); z.label.classList.add('over'); },
-      ondragleave: () => z.label.classList.remove('over'),
-      ondrop: (e) => { e.preventDefault(); z.label.classList.remove('over'); const f = e.dataTransfer.files[0]; if (f) onFile(f); },
-    }, z.input, z.main, z.sub);
-    return z;
-  };
+  const tiles = h('div', { class: 'wizard' });
+  const next = h('button', { type: 'button', class: 'btn primary next-btn', onclick: () => openConfirm() }, '다음');
+  const nextHint = h('p', { class: 'next-hint' });
+  const conn = h('button', { type: 'button', class: 'conn', onclick: () => openSettings() });
 
-  /* 1. 대상 */
-  const kinds = [['stm32', 'STM32 · SWD'], ['esp', 'ESP32 · UART']];
-  el.chip = h('select', { onchange: (e) => { up.chip = e.target.value; up.project = ''; fillProjects(); buildSlots(); onProject(); } },
-    kinds.map(([k, label]) => h('optgroup', { label }, m.chips.filter((c) => (c.kind || 'stm32') === k).map((c) => h('option', { value: c.id }, c.name)))));
-  el.chip.value = up.chip;
-  el.project = h('select', { onchange: (e) => { up.project = e.target.value; onProject(); } });
-  el.newBox = h('div', { class: 'fields sub' },
-    field('프로젝트 ID', bind('id', 'input', { placeholder: 'h723', autocomplete: 'off', spellcheck: 'false' }), 'id',
-      { hint: 'SD의 /prog/fw/<ID>/ 폴더명. 영문·숫자·_·- 1~24자' }),
-    field('이름', bind('name', 'input', { placeholder: 'H723 GFX firmware', autocomplete: 'off' }), 'name',
-      { hint: '프로그래머 화면과 fw.txt에 표시. ASCII 47자 이내' }),
-    field('설명', bind('desc', 'input', { placeholder: '사이트에만 표시, 한글 가능', autocomplete: 'off' }), 'desc', { wide: true }));
-  el.chipFacts = h('dl', { class: 'facts' });
+  app.replaceChildren(h('section', { class: 'page upload-page' },
+    h('div', { class: 'upload-head' },
+      h('div', {},
+        h('h1', {}, '펌웨어 등록'),
+        h('p', { class: 'lead' }, '세 가지를 고르고 다음을 누르면 등록 요청(PR)이 만들어집니다.')),
+      conn),
+    tiles,
+    h('div', { class: 'next-row' }, next, nextHint),
+    h('p', { class: 'upload-foot' }, 'PR의 자동 검사가 통과한 뒤 GitHub에서 머지하면 사이트에 게시됩니다. ',
+      h('a', { href: 'https://github.com/CAN-dubu/hg-swd-fw-hub/tree/main/registry/firmware', target: '_blank', rel: 'noopener' }, '파일로 직접 등록하는 법'))));
 
-  /* 2. 바이너리: STM32는 하나, ESP는 고정 슬롯 */
-  el.stm32 = dropZone(async (file) => { up.image = await readFile(file); clearResult(); update(); });
-  el.stm32Box = h('div', {}, el.stm32.label);
-  el.espBox = h('div', { class: 'slots' });
-  el.checks = h('ul', { class: 'checks' });
-
-  /* 4. 확인 */
-  el.files = h('ul', { class: 'files' });
-  el.fwtxt = h('pre', { class: 'code' });
-  el.tokenInput = h('input', { type: 'password', placeholder: 'github_pat_…', autocomplete: 'off', spellcheck: 'false', value: up.token.value,
-    oninput: (e) => { up.token.value = e.target.value.trim(); saveToken(up.token.value, up.token.remember); el.tokenStatus.textContent = ''; update(); } });
-  el.remember = h('input', { type: 'checkbox', checked: up.token.remember,
-    onchange: (e) => { up.token.remember = e.target.checked; saveToken(up.token.value, up.token.remember); } });
-  el.tokenStatus = h('span', { class: 'hint' });
-  el.submit = h('button', { type: 'button', class: 'btn primary', onclick: submit }, 'PR 만들기');
-  el.blocker = h('span', { class: 'hint' });
-  el.log = h('ul', { class: 'checks log' });
-  el.result = h('div', {});
-
-  const step = (n, title, ...body) => h('section', { class: 'panel step' }, h('h2', {}, h('span', { class: 'step-no' }, n), title), ...body);
-
-  app.replaceChildren(h('section', { class: 'page' },
-    h('h1', {}, '펌웨어 등록'),
-    h('p', { class: 'lead' }, '바이너리를 올리면 저장소에 PR이 만들어집니다. PR의 CI 검사가 통과한 뒤 GitHub에서 머지하면 사이트에 게시됩니다.'),
-    h('div', { class: 'form' },
-      step('1', '대상',
-        h('div', { class: 'fields' },
-          field('칩', el.chip, 'chip'),
-          field('프로젝트', el.project, 'project')),
-        el.newBox,
-        h('div', { class: 'fixed' }, h('span', { class: 'fixed-title' }, '칩이 정하는 값 (수정 불가)'), el.chipFacts)),
-      step('2', '바이너리', el.stm32Box, el.espBox, el.checks),
-      step('3', '릴리스 정보',
-        h('div', { class: 'fields' },
-          field('버전', bind('version', 'input', { autocomplete: 'off', spellcheck: 'false' }), 'version',
-            { hint: 'x.y.z. 태그(-rc.1 등)를 붙이면 프리릴리스로 기기 자동 업데이트에서 빠짐' }),
-          field('날짜', bind('date', 'input', { type: 'date' }), 'date'),
-          field('UART 속도 상한', bind('baud', 'select', {}, ['auto', '921600', '460800', '230400', '115200']
-            .map((b) => h('option', { value: b }, b === 'auto' ? 'auto (921600부터 검사)' : `${b} bps`))), 'baud',
-            { hint: '연결 검사에 실패하면 프로그래머가 자동으로 낮춤' }),
-          field('변경 내용', bind('notes', 'textarea', { rows: '4', placeholder: '- 변경 내용' }), 'notes', { wide: true }))),
-      step('4', '확인 및 등록',
-        h('h3', { class: 'mini' }, '커밋될 파일'), el.files,
-        h('h3', { class: 'mini' }, '생성될 fw.txt'), el.fwtxt,
-        h('h3', { class: 'mini' }, 'GitHub 토큰'),
-        h('div', { class: 'token-row' }, el.tokenInput,
-          h('button', { type: 'button', class: 'btn', onclick: checkToken }, '연결 확인')),
-        h('label', { class: 'check' }, el.remember, ' 이 브라우저에 기억 (끄면 탭을 닫을 때 지움)'),
-        el.tokenStatus,
-        h('details', { class: 'help' },
-          h('summary', {}, '토큰 만드는 법'),
-          h('ol', {},
-            h('li', {}, h('a', { href: 'https://github.com/settings/personal-access-tokens/new', target: '_blank', rel: 'noopener' }, 'Fine-grained token 만들기'), '를 엽니다.'),
-            h('li', {}, 'Repository access: ', h('b', {}, 'Only select repositories'), ' → ', h('code', {}, `${REPO.owner}/${REPO.name}`)),
-            h('li', {}, 'Permissions: ', h('b', {}, 'Contents'), '와 ', h('b', {}, 'Pull requests'), '를 Read and write로'),
-            h('li', {}, '만든 토큰을 위 칸에 붙여 넣습니다. 토큰은 이 브라우저에만 저장되고 GitHub API 외에는 보내지 않습니다.'))),
-        h('div', { class: 'actions' }, el.submit, el.blocker),
-        el.log, el.result))));
-
-  function clearResult() {
-    el.result.replaceChildren();
-    el.log.replaceChildren();
+  function tile(n, kind, label, { value, sub, state: st, disabled, onclick }) {
+    return h('button', { type: 'button', class: `tile ${st || ''}`, disabled: disabled || null, onclick },
+      h('span', { class: 'tile-n' }, n),
+      icon(kind, 'tile-ico'),
+      h('span', { class: 'tile-label' }, label),
+      h('span', { class: 'tile-value' }, value),
+      h('span', { class: 'tile-sub' }, sub || ''));
   }
 
-  function fillProjects() {
-    const list = m.projects.filter((p) => p.chip === up.chip);
-    el.project.replaceChildren(
-      ...list.map((p) => h('option', { value: p.id }, `${p.name} (${p.id}) · v${p.latest}`)),
-      h('option', { value: '' }, '＋ 새 프로젝트'));
-    if (!list.some((p) => p.id === up.project)) up.project = list[0]?.id || '';
-    el.project.value = up.project;
-  }
+  function refresh() {
+    const p = planUpload();
+    const chip = p.chip;
+    const fileCount = chip?.kind === 'esp' ? Object.keys(up.esp).length : up.image ? 1 : 0;
+    const slotError = Object.values(p.pkg.slotChecks).flat().some(([c]) => c === 'err') || p.pkg.checks.some(([c]) => c === 'err');
+    const partial = chip?.kind === 'esp' && fileCount < chip.slots.length && !slotError;
+    const fileState = !fileCount ? '' : partial ? 'partial' : p.errors.image ? 'bad' : 'done';
+    const fileValue = !fileCount ? '파일 선택'
+      : chip.kind === 'esp' ? `파일 ${fileCount} / ${chip.slots.length}` : up.image.name;
+    const fileSub = !fileCount ? (chip?.kind === 'esp' ? 'bootloader · partitions · firmware' : chip ? 'BIN 파일 하나' : '')
+      : partial ? `${chip.slots.length - fileCount}개 더 필요` : p.errors.image ? p.errors.image : `${fmtSize(p.pkg.images.reduce((n, i) => n + i.bytes.length, 0))} · 검사 통과`;
 
-  /* ESP 칩마다 부트로더 주소가 달라 슬롯을 다시 만든다 */
-  function buildSlots() {
-    const chip = chipOf(up.chip);
-    el.slots = {};
-    el.espBox.replaceChildren(...(chip.kind === 'esp' ? [
-      ...chip.slots.map((s) => {
-        const z = dropZone(async (file) => { up.esp[s.name] = await readFile(file); clearResult(); update(); });
-        const checks = h('ul', { class: 'checks' });
-        el.slots[s.name] = { ...z, checks };
-        return h('div', { class: 'slot' },
-          h('div', { class: 'slot-head' }, h('code', { class: 'slot-name' }, s.name), h('span', { class: 'muted' }, '@ ', h('code', {}, s.address))),
-          z.label, checks);
-      }),
-      h('p', { class: 'hint slot-note' }, 'ota-reset.bin은 올리지 않습니다. 파티션 표에 OTA data가 있으면 CI가 0xFF로 채워 생성합니다.'),
-    ] : []));
-  }
+    tiles.replaceChildren(
+      tile('1', 'chip', '칩', chip
+        ? { value: chip.name, sub: chip.kind === 'esp' ? 'UART로 기록' : 'SWD로 기록', state: 'done', onclick: () => openChip() }
+        : { value: '칩 선택', sub: 'STM32 · ESP32', onclick: () => openChip() }),
+      icon('chevron', 'tile-arrow'),
+      tile('2', 'folder', '프로젝트', !chip
+        ? { value: '프로젝트 선택', sub: '칩을 먼저 고르세요', disabled: true }
+        : p.proj ? { value: p.proj.name, sub: `${p.proj.id} · 현재 v${p.proj.latest}`, state: 'done', onclick: () => openProject() }
+        : p.isNew ? { value: p.pname || '새 프로젝트', sub: p.errors.project ? '정보 입력 필요' : `새로 만들기 · ${p.pid}`, state: p.errors.project ? 'bad' : 'done', onclick: () => openProject() }
+        : { value: '프로젝트 선택', sub: '기존 또는 새 프로젝트', onclick: () => openProject() }),
+      icon('chevron', 'tile-arrow'),
+      tile('3', 'file', '펌웨어 파일', !chip
+        ? { value: '파일 선택', sub: '칩을 먼저 고르세요', disabled: true }
+        : { value: fileValue, sub: fileSub, state: fileState, onclick: () => openFiles() }));
 
-  function onProject() {
-    up.version = suggestVersion(m.projects.find((p) => p.id === up.project));
-    el.version.value = up.version;
-    update();
-  }
-
-  async function checkToken() {
-    el.tokenStatus.className = 'hint';
-    el.tokenStatus.textContent = '확인 중…';
-    try {
-      const r = await gh(up.token.value, 'GET', repoPath);
-      const ok = r.permissions?.push;
-      el.tokenStatus.className = ok ? 'hint ok' : 'hint bad';
-      el.tokenStatus.textContent = ok ? `✔ ${r.full_name} 쓰기 권한 확인` : `✖ ${r.full_name} 쓰기 권한 없음`;
-    } catch (e) {
-      el.tokenStatus.className = 'hint bad';
-      el.tokenStatus.textContent = `✖ ${e.message}`;
-    }
-  }
-
-  /* 현재 입력으로 검사 결과·미리보기·커밋 내용을 만든다 */
-  function plan() {
-    const chip = chipOf(up.chip);
-    const esp = chip.kind === 'esp';
-    const proj = m.projects.find((p) => p.id === up.project) || null;
-    const errors = {};
-    const err = (k, msg) => { errors[k] = errors[k] || msg; };
-    const pid = proj ? proj.id : up.id.trim();
-    const pname = proj ? proj.name : up.name;
-    const ver = up.version.trim();
-
-    if (!proj) {
-      if (!ID_RE.test(pid)) err('id', 'ID 형식이 맞지 않습니다');
-      else if (m.projects.some((p) => p.id.toLowerCase() === pid.toLowerCase())) err('id', '이미 있는 ID입니다 (SD는 대소문자를 구분하지 않음)');
-      if (!NAME_RE.test(pname) || pname !== pname.trim()) err('name', '출력 가능한 ASCII 1~47자, 앞뒤 공백 없이');
-    }
-    if (!VERSION_RE.test(ver)) err('version', 'x.y.z 또는 x.y.z-태그 형식');
-    else if (proj?.versions.some((v) => v.version === ver)) err('version', '이미 게시된 버전입니다');
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(up.date)) err('date', '날짜를 고르세요');
-
-    const pkg = (esp ? planEsp : planStm32)(chip, errors.name ? null : pname);
-    if (pkg.error) err('image', pkg.error);
-    if (pkg.fwTxt && pkg.fwTxt.length > 1024) err('image', 'fw.txt가 1,024바이트를 넘습니다');
-
-    const dir = `registry/firmware/${pid || '<ID>'}`;
-    const vdir = `${dir}/${ver || '<버전>'}`;
-    const notes = up.notes.trim();
-    const files = [];
-    if (!proj) files.push([`${dir}/project.toml`,
-      `name        = ${tomlString(pname)}\nchip        = ${tomlString(chip.id)}\ndescription = ${tomlString(up.desc.trim())}\n`]);
-    files.push([`${vdir}/release.toml`, `date  = ${up.date}\n` + (esp ? `baud  = "${up.baud}"\n` : '') + (notes ? `notes = ${tomlString(notes, true)}\n` : '')]);
-    files.push(...pkg.upload.map(([name, bytes]) => [`${vdir}/${name}`, bytes]));
-    return { chip, esp, proj, pid, pname, ver, errors, pkg, files };
-  }
-
-  function update() {
-    const p = plan();
-    const { chip, pkg } = p;
-
-    el.newBox.hidden = !!p.proj;
-    el.stm32Box.hidden = p.esp;
-    el.espBox.hidden = !p.esp;
-    el.f_baud.hidden = !p.esp;
-    const facts = p.esp
-      ? [['device', chip.device], ['방식', 'UART · RAM stub (로더 파일 불필요)'],
-        ['기록 주소', chip.slots.map((s) => `${s.name.replace('.bin', '')} ${s.address}`).join(' · ')], ['Flash / 섹터', `최대 16 MiB / 4 KiB`]]
-      : [['device', chip.device], ['로더', loaderOf(chip.loader).sd_path], ['기록 주소', chip.flash_base],
-        ['Flash / 섹터', `${fmtSize(chip.flash_size)} / ${fmtSize(chip.sector_size)}`]];
-    el.chipFacts.replaceChildren(...facts.map(([k, v]) => h('div', { class: 'fact' + (k === '기록 주소' && p.esp ? ' wide' : '') }, h('dt', {}, k), h('dd', {}, h('code', {}, v)))));
-
-    for (const k of ['id', 'name', 'version', 'date']) {
-      const quiet = (k === 'id' || k === 'name') && up[k] === '';  // 아직 입력 전이면 표시하지 않음
-      const msg = quiet ? '' : p.errors[k] || '';
-      el[`err_${k}`].textContent = msg;
-      el[`f_${k}`].classList.toggle('invalid', !!msg);
-    }
-
-    const showFile = (z, file, empty) => {
-      z.main.textContent = file ? file.name : 'BIN 파일을 끌어다 놓거나 눌러서 선택';
-      z.sub.replaceChildren(...hexify(file ? `${fmtSize(file.bytes.length)} · CRC32 ${hex32(file.crc)} · 바꾸려면 다시 선택` : empty));
-      z.label.classList.toggle('has', !!file);
-    };
-    if (p.esp) {
-      for (const s of chip.slots) {
-        const z = el.slots[s.name];
-        showFile(z, up.esp[s.name], `${s.name}를 놓으세요`);
-        z.checks.replaceChildren(...(pkg.slotChecks[s.name] || []).map(checkItem));
-      }
-    } else {
-      showFile(el.stm32, up.image, `${chip.flash_base}부터 시작하는 전체 이미지, 최대 ${fmtSize(chip.flash_size)}`);
-    }
-    const emb = pkg.embedded;
-    el.checks.replaceChildren(...[
-      ...pkg.checks.map(checkItem),
-      !p.esp && emb?.version && p.ver && emb.version.replace(/^v/i, '') !== p.ver
-        ? checkItem(['info', `내장 버전과 등록 버전(${p.ver})이 다릅니다. 게시는 되지만 확인하세요.`]) : null,
-      !p.esp && up.image ? h('li', { class: 'info' }, h('span', {}, 'SHA-256 ', h('code', { class: 'hash' }, up.image.sha))) : null,
-    ].filter(Boolean));
-
-    el.files.replaceChildren(...p.files.map(([path, content]) => h('li', {},
-      h('code', {}, path),
-      h('span', { class: 'muted' }, content == null ? '' : typeof content === 'string' ? `${content.length} B` : fmtSize(content.length)))));
-    el.fwtxt.textContent = pkg.fwTxt || '(이름과 바이너리 검사가 끝나면 표시됩니다)';
-
-    const firstError = Object.values(p.errors)[0];
-    const blocker = firstError || (!up.token.value ? 'GitHub 토큰을 입력하세요' : '');
-    el.submit.disabled = !!blocker || up.busy;
-    el.blocker.textContent = up.busy ? '진행 중…' : blocker;
+    const ready = selectionReady(p);
+    next.disabled = !ready;
+    nextHint.textContent = ready ? '' : p.errors.chip || p.errors.project || (fileCount ? p.errors.image : '펌웨어 파일을 고르세요');
+    conn.replaceChildren(icon('gear'), up.token.value ? 'GitHub 연결됨' : 'GitHub 연결');
+    conn.classList.toggle('on', !!up.token.value);
     return p;
   }
 
-  async function submit() {
-    const p = update();
-    if (el.submit.disabled) return;
-    up.busy = true;
-    update();
-    clearResult();
-    const log = (text, cls) => { const li = h('li', { class: cls || null }, text); el.log.append(li); return li; };
-    const t = up.token.value;
-    const dir = `registry/firmware/${p.pid}`;
-    const { images, embedded: emb, fwTxt } = p.pkg;
-    try {
-      log(`${REPO.base} 브랜치 확인`);
-      const ref = await gh(t, 'GET', `${repoPath}/git/ref/heads/${REPO.base}`, null, true);
-      if (!ref) throw new Error(`${REPO.base} 브랜치가 없습니다. 저장소에 첫 커밋을 먼저 푸시하세요.`);
-      const baseSha = ref.object.sha;
-      const baseCommit = await gh(t, 'GET', `${repoPath}/git/commits/${baseSha}`);
+  /* ① 칩 */
+  function openChip() {
+    const groups = [['stm32', 'STM32 · SWD', '내부 Flash에 SWD로 기록합니다. ST 로더를 사용합니다.'],
+      ['esp', 'ESP32 · UART', '부트로더·파티션·앱 세 파일을 UART로 기록합니다.']];
+    const modal = openModal('칩 선택', {
+      body: h('div', { class: 'opt-list' }, groups.map(([kind, title, desc]) => {
+        const chips = m.chips.filter((c) => (c.kind || 'stm32') === kind);
+        return chips.length ? [h('div', { class: 'opt-group' }, h('b', {}, title), h('span', {}, desc)),
+          chips.map((c) => option(c.name, kind === 'esp' ? `${c.device} · 부트로더 ${c.slots[0].address}` : `${c.device} · Flash ${fmtSize(c.flash_size)}`,
+            `k-${kind}`, up.chip === c.id, () => {
+              if (up.chip !== c.id) { up.project = ''; up.image = null; up.esp = {}; }
+              up.chip = c.id;
+              modal.close();
+              refresh();
+              setTimeout(openProject, reduceMotion() ? 0 : 200);
+            }, 'chip'))] : null;
+      })),
+    });
+  }
 
-      log('중복 확인 (사이트 배포 전에 머지된 것 포함)');
-      if (await existsOnBase(t, `${dir}/${p.ver}/release.toml`)) throw new Error(`${p.pid} ${p.ver}가 이미 ${REPO.base}에 있습니다.`);
-      if (!p.proj && await existsOnBase(t, `${dir}/project.toml`)) throw new Error(`프로젝트 ${p.pid}가 이미 ${REPO.base}에 있습니다. 새로고침 후 기존 프로젝트로 선택하세요.`);
+  /* ② 프로젝트 */
+  function openProject() {
+    const chip = chipOf(up.chip);
+    const list = m.projects.filter((p) => p.chip === up.chip);
+    let modal;
+    const form = h('div', { class: 'new-form' });
+    const choose = (id) => {
+      up.project = id;
+      up.version = suggestVersion(m.projects.find((p) => p.id === id));
+      modal.close();
+      refresh();
+      if (!(chip.kind === 'esp' ? Object.keys(up.esp).length : up.image)) setTimeout(openFiles, reduceMotion() ? 0 : 200);
+    };
 
-      const tree = [];
-      for (const [path, content] of p.files) {
-        log(`업로드 ${path.split('/').slice(-2).join('/')}`);
-        const blob = await gh(t, 'POST', `${repoPath}/git/blobs`, typeof content === 'string'
-          ? { content, encoding: 'utf-8' } : { content: base64(content), encoding: 'base64' });
-        tree.push({ path, mode: '100644', type: 'blob', sha: blob.sha });
+    function newForm() {
+      const field = (label, key, attrs, hint) => {
+        const err = h('span', { class: 'err' });
+        const input = h('input', { ...attrs, autocomplete: 'off', spellcheck: 'false', oninput: (e) => { up[key] = e.target.value; check(); } });
+        input.value = up[key];
+        return { el: h('label', { class: 'field' }, h('span', { class: 'field-label' }, label), input, hint ? h('span', { class: 'hint' }, hint) : null, err), err, input, key };
+      };
+      const f = [field('프로젝트 ID', 'id', { placeholder: 'h723-gfx' }, 'SD카드 폴더 이름이 됩니다'),
+        field('표시 이름', 'name', { placeholder: 'H723 GFX firmware' }, '프로그래머 화면에 나옵니다 (영문)'),
+        field('설명 (선택)', 'desc', { placeholder: '한글로 자유롭게' })];
+      const ok = h('button', { type: 'button', class: 'btn primary', onclick: () => {
+        up.project = NEW_PROJECT;
+        if (!check(true)) return;
+        up.version = '1.0.0';
+        modal.close();
+        refresh();
+        if (!(chip.kind === 'esp' ? Object.keys(up.esp).length : up.image)) setTimeout(openFiles, reduceMotion() ? 0 : 200);
+      } }, '이 프로젝트로 만들기');
+      function check(force) {
+        const saved = up.project;
+        up.project = NEW_PROJECT;
+        const p = planUpload();
+        up.project = saved;
+        for (const x of f) x.err.textContent = (force || up[x.key]) ? p.errors[x.key] || '' : '';
+        ok.disabled = !!(p.errors.id || p.errors.name);
+        return !ok.disabled;
       }
-      const newTree = await gh(t, 'POST', `${repoPath}/git/trees`, { base_tree: baseCommit.tree.sha, tree });
+      form.replaceChildren(...f.map((x) => x.el), h('div', { class: 'form-actions' }, ok));
+      form.classList.add('open');
+      check();
+      setTimeout(() => f[0].input.focus(), 50);
+    }
 
-      const title = `Add ${p.pid} ${p.ver} (${p.chip.name})`;
-      const embText = emb ? `${emb.version || '-'} / ${emb.name || '-'}${emb.idf ? ` / IDF ${emb.idf}` : ''}` : null;
-      const facts = [
-        ...images.map((i) => `${i.name} @ ${hex32(parseInt(i.address, 16))}: ${i.bytes.length} bytes, CRC32 ${hex32(i.crc)}` +
-          (i.generated ? ' (generated)' : `, from ${i.source}`)),
-        embText ? `Embedded: ${embText}` : null,
-      ].filter(Boolean);
-      log('커밋 생성');
-      const commit = await gh(t, 'POST', `${repoPath}/git/commits`, {
-        message: `${title}\n\n${facts.join('\n')}\nRegistered from the HG-SWD FW Hub web form.`,
-        tree: newTree.sha, parents: [baseSha],
-      });
+    modal = openModal('프로젝트 선택', {
+      body: h('div', {},
+        h('p', { class: 'modal-lead' }, chipBadge(chip), ' 에 기록할 프로젝트를 고르세요.'),
+        h('div', { class: 'opt-list' },
+          list.length ? list.map((p) => option(p.name, `${p.id} · 현재 v${p.latest} · ${relDate(p.updated)}`, '', up.project === p.id, () => choose(p.id), 'folder'))
+            : h('p', { class: 'muted empty-note' }, '이 칩으로 등록된 프로젝트가 아직 없습니다.'),
+          option('새 프로젝트 만들기', '처음 등록하는 펌웨어', 'new', up.project === NEW_PROJECT, newForm, 'plus')),
+        form),
+    });
+    if (up.project === NEW_PROJECT || !list.length) newForm();
+  }
 
-      let branch = `fw/${p.pid}-${p.ver}`;
-      if (await gh(t, 'GET', `${repoPath}/git/ref/heads/${encPath(branch)}`, null, true)) branch += `-${Date.now().toString(36)}`;
-      log(`브랜치 ${branch}`);
-      await gh(t, 'POST', `${repoPath}/git/refs`, { ref: `refs/heads/${branch}`, sha: commit.sha });
+  /* ③ 파일 */
+  function openFiles() {
+    const chip = chipOf(up.chip);
+    const esp = chip.kind === 'esp';
+    const body = h('div', {});
+    const done = h('button', { type: 'button', class: 'btn primary', onclick: () => modal.close() }, '완료');
+    const modal = openModal(esp ? '펌웨어 파일 (ESP)' : '펌웨어 파일', { body, footer: done, wide: esp });
 
-      log('PR 생성');
-      const body = [
-        `| 항목 | 값 |`, `| --- | --- |`,
-        `| 프로젝트 | ${p.pname} (\`${p.pid}\`)${p.proj ? '' : ' — 새 프로젝트'} |`,
-        `| 칩 | ${p.chip.name} |`,
-        `| 버전 | ${p.ver} (${up.date}) |`,
-        p.esp ? `| UART 속도 상한 | ${up.baud} |` : null,
-        embText ? `| 내장 정보 | ${embText} |` : null,
-        '', '| 파일 | 주소 | 크기 | CRC32 | SHA-256 |', '| --- | --- | ---: | --- | --- |',
-        ...images.map((i) => `| ${i.name}${i.generated ? ' (CI 생성)' : ''} | \`${hex32(parseInt(i.address, 16))}\` | ${i.bytes.length.toLocaleString()} | \`${hex32(i.crc)}\` | ${i.sha ? `\`${i.sha.slice(0, 16)}…\`` : '-'} |`),
-        '', '### fw.txt', '```ini', fwTxt.trimEnd(), '```',
-        up.notes.trim() ? `\n### 변경 내용\n${up.notes.trim()}` : null,
-        '', 'CI(Build and deploy)가 통과하면 머지하세요. 머지 후 1~2분 안에 사이트에 게시됩니다.',
-      ].filter((x) => x !== null).join('\n');
-      const pr = await gh(t, 'POST', `${repoPath}/pulls`, { title, head: branch, base: REPO.base, body });
+    async function take(files) {
+      for (const f of files) {
+        const slot = esp ? espSlotFor(f.name) : 'app';
+        if (!slot) continue;
+        const read = await readFile(f);
+        if (esp) up.esp[slot] = read; else up.image = read;
+      }
+      draw();
+      refresh();
+    }
 
-      log(`PR #${pr.number} 생성 완료`, 'ok-strong');
-      el.result.append(h('div', { class: 'done-box' },
-        h('div', {}, h('b', {}, `PR #${pr.number}`), ` ${title}`),
-        h('p', { class: 'muted' }, 'PR 페이지에서 CI 검사 결과를 확인하고 Merge 하세요. 머지하면 Actions가 사이트를 다시 배포합니다.'),
-        h('a', { class: 'btn primary', href: pr.html_url, target: '_blank', rel: 'noopener' }, 'PR 열기')));
-      up.image = null;
-      up.esp = {};
-      app.querySelectorAll('input[type=file]').forEach((i) => { i.value = ''; });
-    } catch (e) {
-      log(e.message || String(e), 'err');
-    } finally {
-      up.busy = false;
-      update();
+    function draw() {
+      const p = planUpload();
+      const list = (items) => h('ul', { class: 'checks' }, items.map(checkItem));
+      if (!esp) {
+        put(body,
+          up.image
+            ? h('div', { class: 'picked' }, icon('file', 'picked-ico'), h('div', {}, h('b', {}, up.image.name),
+                h('span', { class: 'muted' }, ` ${fmtSize(up.image.bytes.length)}`)), h('button', { type: 'button', class: 'link-btn', onclick: () => { up.image = null; draw(); refresh(); } }, '바꾸기'))
+            : dropZone(take, { title: 'BIN 파일을 끌어다 놓거나 눌러서 선택', hint: `${chip.flash_base}부터 시작하는 전체 이미지 · 최대 ${fmtSize(chip.flash_size)}` }),
+          p.pkg.checks.length ? list(p.pkg.checks) : null);
+      } else {
+        const filled = Object.keys(up.esp).length;
+        put(body,
+          filled < chip.slots.length
+            ? dropZone(take, { multiple: true, title: '세 파일을 한 번에 끌어다 놓으세요', hint: '파일 이름을 보고 아래 칸에 자동으로 넣습니다' })
+            : null,
+          h('div', { class: 'slot-list' }, chip.slots.map((s) => {
+            const f = up.esp[s.name];
+            const checks = p.pkg.slotChecks[s.name] || [];
+            const bad = checks.some(([c]) => c === 'err');
+            return h('div', { class: `slot-row ${f ? (bad ? 'bad' : 'done') : ''}` },
+              h('span', { class: 'slot-state' }, f ? icon(bad ? 'alert' : 'check') : icon('file')),
+              h('div', { class: 'slot-main' },
+                h('div', {}, h('b', {}, s.name), h('code', { class: 'slot-addr' }, s.address)),
+                f ? h('span', { class: 'muted' }, `${f.name} · ${fmtSize(f.bytes.length)}`) : h('span', { class: 'muted' }, '비어 있음'),
+                checks.length ? list(checks) : null),
+              h('label', { class: 'btn slot-pick' }, f ? '바꾸기' : '선택',
+                h('input', { type: 'file', accept: '.bin', hidden: true, onchange: async (e) => {
+                  if (!e.target.files[0]) return;
+                  up.esp[s.name] = await readFile(e.target.files[0]);
+                  draw();
+                  refresh();
+                } })));
+          })),
+          h('p', { class: 'hint' }, 'ota-reset.bin은 올리지 않아도 됩니다. 파티션에 OTA 영역이 있으면 자동으로 만듭니다.'),
+          p.pkg.checks.length ? list(p.pkg.checks) : null);
+      }
+      done.textContent = p.errors.image ? '닫기' : '완료';
+    }
+    draw();
+  }
+
+  /* 다음 → 확인 */
+  function openConfirm() {
+    const p0 = planUpload();
+    if (!selectionReady(p0)) return;
+    if (!up.version || p0.errors.version) up.version = suggestVersion(p0.proj);
+    const body = h('div', {});
+    const submitBtn = h('button', { type: 'button', class: 'btn primary', onclick: () => run() }, '등록 요청 만들기');
+    const cancel = h('button', { type: 'button', class: 'btn', onclick: () => modal.close() }, '취소');
+    const reason = h('span', { class: 'foot-reason' });
+    const modal = openModal('등록 확인', { body, footer: [reason, cancel, submitBtn] });
+    let tokenInput = null;
+
+    const field = (label, control, key, hint) => h('label', { class: 'field' }, h('span', { class: 'field-label' }, label), control,
+      hint ? h('span', { class: 'hint' }, hint) : null, h('span', { class: 'err', 'data-err': key }));
+    const bindInput = (key, tag, attrs = {}, children = []) => {
+      const c = h(tag, { ...attrs, [tag === 'select' ? 'onchange' : 'oninput']: (e) => { up[key] = e.target.value; check(); } }, children);
+      c.value = up[key];
+      return c;
+    };
+    const p = planUpload();
+    const summary = h('dl', { class: 'summary' },
+      h('div', {}, h('dt', {}, '칩'), h('dd', {}, chipBadge(p.chip))),
+      h('div', {}, h('dt', {}, '프로젝트'), h('dd', {}, p.pname, h('code', {}, p.pid), p.isNew ? h('span', { class: 'tag ok' }, '새로 만들기') : null)),
+      h('div', {}, h('dt', {}, '파일'), h('dd', {}, p.pkg.images.map((i) => h('span', { class: 'file-chip' }, i.name, i.generated ? ' (자동)' : '')),
+        h('span', { class: 'muted' }, ` 총 ${fmtSize(p.pkg.images.reduce((n, i) => n + i.bytes.length, 0))}`))));
+    const preview = h('pre', { class: 'code' });
+    const commitList = h('ul', { class: 'files' });
+
+    body.append(summary,
+      h('div', { class: 'fields' },
+        field('버전', bindInput('version', 'input', { autocomplete: 'off', spellcheck: 'false' }), 'version',
+          p.proj ? `지금 게시된 버전은 v${p.proj.latest}입니다` : '처음이면 1.0.0'),
+        field('변경 내용 (선택)', bindInput('notes', 'textarea', { rows: '3', placeholder: '무엇이 바뀌었는지 한두 줄' }), 'notes')),
+      h('details', { class: 'more' }, h('summary', {}, '고급 설정'),
+        h('div', { class: 'fields' },
+          field('날짜', bindInput('date', 'input', { type: 'date' }), 'date'),
+          p.esp ? field('UART 속도 상한', bindInput('baud', 'select', {}, ['auto', '921600', '460800', '230400', '115200']
+            .map((b) => h('option', { value: b }, b === 'auto' ? 'auto (권장)' : `${b} bps`))), 'baud', '통신이 불안정하면 낮추세요') : null)),
+      h('details', { class: 'more' }, h('summary', {}, '자세히 보기 (fw.txt · 커밋 파일)'), preview, commitList));
+    if (!up.token.value) {
+      tokenInput = h('input', { type: 'password', placeholder: 'github_pat_…', autocomplete: 'off', spellcheck: 'false',
+        oninput: (e) => { up.token.value = e.target.value.trim(); saveToken(up.token.value, up.token.remember); check(); refresh(); } });
+      body.append(h('div', { class: 'token-box' },
+        h('b', {}, 'GitHub 연결이 한 번 필요합니다'),
+        h('p', { class: 'hint' }, '이 저장소에 쓸 수 있는 토큰을 붙여 넣으세요. 이 브라우저에만 저장됩니다. ',
+          h('a', { href: 'https://github.com/settings/personal-access-tokens/new', target: '_blank', rel: 'noopener' }, '토큰 만들기'),
+          ' (저장소: ', h('code', {}, `${REPO.owner}/${REPO.name}`), ', 권한: Contents·Pull requests 쓰기)'),
+        tokenInput));
+    }
+
+    function check() {
+      const q = planUpload();
+      body.querySelectorAll('[data-err]').forEach((e) => { e.textContent = q.errors[e.dataset.err] || ''; });
+      preview.textContent = q.pkg.fwTxt || '';
+      commitList.replaceChildren(...q.files.map(([path, content]) => h('li', {}, h('code', {}, path),
+        h('span', { class: 'muted' }, typeof content === 'string' ? `${content.length} B` : fmtSize(content.length)))));
+      const why = Object.values(q.errors)[0] || (!up.token.value ? 'GitHub 토큰을 넣어 주세요' : '');
+      submitBtn.disabled = !!why;
+      reason.textContent = why;
+      return q;
+    }
+    check();
+
+    async function run() {
+      const q = check();
+      if (submitBtn.disabled) return;
+      modal.locked = true;
+      const bar = h('div', { class: 'bar-fill' });
+      const stepText = h('p', { class: 'run-step' }, '준비 중…');
+      modal.set(h('div', { class: 'run' }, h('div', { class: 'run-ring' }, icon('upload')), h('h3', {}, `${q.pname} v${q.ver}`),
+        h('div', { class: 'bar' }, bar), stepText), null);
+      const total = q.files.length + 4;
+      let n = 0;
+      const step = (text) => { n++; stepText.textContent = text; bar.style.width = `${Math.round((n / total) * 100)}%`; };
+      try {
+        const pr = await submitPlan(q, step);
+        bar.style.width = '100%';
+        modal.locked = false;
+        modal.set(h('div', { class: 'run done' },
+          h('div', { class: 'run-ring ok' }, icon('check')),
+          h('h3', {}, '등록 요청을 만들었습니다'),
+          h('p', { class: 'muted' }, `PR #${pr.number} · ${q.pid} v${q.ver}`),
+          h('p', { class: 'hint' }, 'PR에서 자동 검사가 통과하면 Merge 하세요. 1~2분 뒤 사이트에 게시되고, 오른쪽 위 새로고침으로 확인할 수 있습니다.')),
+        [h('button', { type: 'button', class: 'btn', onclick: () => { modal.close(); resetUpload(); renderUpload(); } }, '다른 펌웨어 등록'),
+          h('a', { class: 'btn primary', href: pr.html_url, target: '_blank', rel: 'noopener' }, 'PR 열기')]);
+      } catch (e) {
+        modal.locked = false;
+        modal.set(h('div', { class: 'run' },
+          h('div', { class: 'run-ring bad' }, icon('alert')),
+          h('h3', {}, '등록하지 못했습니다'),
+          h('p', { class: 'run-error' }, e.message || String(e))),
+        [h('button', { type: 'button', class: 'btn', onclick: () => modal.close() }, '닫기'),
+          h('button', { type: 'button', class: 'btn primary', onclick: () => { modal.close(); setTimeout(openConfirm, 200); } }, '다시 시도')]);
+      }
     }
   }
 
-  fillProjects();
-  buildSlots();
-  if (!up.version) up.version = suggestVersion(m.projects.find((p) => p.id === up.project));
-  el.version.value = up.version;
-  update();
+  /* GitHub 연결 설정 */
+  function openSettings() {
+    const status = h('p', { class: 'hint' });
+    const input = h('input', { type: 'password', placeholder: 'github_pat_…', autocomplete: 'off', spellcheck: 'false', value: up.token.value,
+      oninput: (e) => { up.token.value = e.target.value.trim(); saveToken(up.token.value, up.token.remember); status.textContent = ''; refresh(); } });
+    const remember = h('input', { type: 'checkbox', checked: up.token.remember || null,
+      onchange: (e) => { up.token.remember = e.target.checked; saveToken(up.token.value, up.token.remember); } });
+    const test = h('button', { type: 'button', class: 'btn', onclick: async () => {
+      status.className = 'hint';
+      status.textContent = '확인 중…';
+      try {
+        const r = await gh(up.token.value, 'GET', repoPath);
+        status.className = r.permissions?.push ? 'hint ok' : 'hint bad';
+        status.textContent = r.permissions?.push ? `✔ ${r.full_name}에 쓸 수 있습니다` : `✖ ${r.full_name}에 쓰기 권한이 없습니다`;
+      } catch (e) {
+        status.className = 'hint bad';
+        status.textContent = `✖ ${e.message}`;
+      }
+    } }, '연결 확인');
+    openModal('GitHub 연결', {
+      body: h('div', {},
+        h('p', { class: 'modal-lead' }, '등록 요청(PR)을 만들 때 쓰는 토큰입니다. 이 브라우저에만 저장되고 GitHub 외에는 보내지 않습니다.'),
+        h('div', { class: 'token-row' }, input, test),
+        h('label', { class: 'check' }, remember, ' 이 브라우저에 계속 기억 (끄면 탭을 닫을 때 지움)'),
+        status,
+        h('ol', { class: 'steps-mini' },
+          h('li', {}, h('a', { href: 'https://github.com/settings/personal-access-tokens/new', target: '_blank', rel: 'noopener' }, 'Fine-grained token 만들기'), ' 열기'),
+          h('li', {}, 'Repository access: ', h('b', {}, 'Only select repositories'), ' → ', h('code', {}, `${REPO.owner}/${REPO.name}`)),
+          h('li', {}, 'Permissions: ', h('b', {}, 'Contents'), ', ', h('b', {}, 'Pull requests'), '를 Read and write로'),
+          h('li', {}, '만든 토큰을 위 칸에 붙여 넣기'))),
+      footer: h('button', { type: 'button', class: 'btn', onclick: () => { saveToken('', false); up.token = { value: '', remember: false }; input.value = ''; refresh(); } }, '연결 해제'),
+    });
+  }
+
+  function option(title, sub, cls, selected, onclick, ico) {
+    return h('button', { type: 'button', class: `opt ${cls}${selected ? ' sel' : ''}`, onclick },
+      icon(ico, 'opt-ico'),
+      h('span', { class: 'opt-text' }, h('b', {}, title), h('span', {}, sub)),
+      selected ? icon('check', 'opt-end') : icon('chevron', 'opt-end'));
+  }
+
+  refresh();
+}
+
+/* 브랜치·커밋 하나·PR을 만든다. step(text)로 진행 상황을 알린다 */
+async function submitPlan(p, step) {
+  const t = up.token.value;
+  const dir = `registry/firmware/${p.pid}`;
+  const { images, embedded: emb, fwTxt } = p.pkg;
+
+  step('저장소 확인');
+  const ref = await gh(t, 'GET', `${repoPath}/git/ref/heads/${REPO.base}`, null, true);
+  if (!ref) throw new Error(`${REPO.base} 브랜치가 없습니다. 저장소에 첫 커밋을 먼저 푸시하세요.`);
+  const baseSha = ref.object.sha;
+  const baseCommit = await gh(t, 'GET', `${repoPath}/git/commits/${baseSha}`);
+
+  step('중복 확인');
+  if (await existsOnBase(t, `${dir}/${p.ver}/release.toml`)) throw new Error(`${p.pid} ${p.ver}는 이미 등록되어 있습니다. 버전을 올려 주세요.`);
+  if (p.isNew && await existsOnBase(t, `${dir}/project.toml`)) throw new Error(`프로젝트 ${p.pid}가 이미 있습니다. 새로고침 후 기존 프로젝트로 고르세요.`);
+
+  const tree = [];
+  for (const [path, content] of p.files) {
+    step(`업로드 ${path.split('/').pop()}`);
+    const blob = await gh(t, 'POST', `${repoPath}/git/blobs`, typeof content === 'string'
+      ? { content, encoding: 'utf-8' } : { content: base64(content), encoding: 'base64' });
+    tree.push({ path, mode: '100644', type: 'blob', sha: blob.sha });
+  }
+  const newTree = await gh(t, 'POST', `${repoPath}/git/trees`, { base_tree: baseCommit.tree.sha, tree });
+
+  step('커밋 만들기');
+  const title = `Add ${p.pid} ${p.ver} (${p.chip.name})`;
+  const embText = emb ? `${emb.version || '-'} / ${emb.name || '-'}${emb.idf ? ` / IDF ${emb.idf}` : ''}` : null;
+  const facts = [
+    ...images.map((i) => `${i.name} @ ${hex32(parseInt(i.address, 16))}: ${i.bytes.length} bytes, CRC32 ${hex32(i.crc)}` +
+      (i.generated ? ' (generated)' : `, from ${i.source}`)),
+    embText ? `Embedded: ${embText}` : null,
+  ].filter(Boolean);
+  const commit = await gh(t, 'POST', `${repoPath}/git/commits`, {
+    message: `${title}\n\n${facts.join('\n')}\nRegistered from the HG-SWD FW Hub web form.`,
+    tree: newTree.sha, parents: [baseSha],
+  });
+  let branch = `fw/${p.pid}-${p.ver}`;
+  if (await gh(t, 'GET', `${repoPath}/git/ref/heads/${encPath(branch)}`, null, true)) branch += `-${Date.now().toString(36)}`;
+  await gh(t, 'POST', `${repoPath}/git/refs`, { ref: `refs/heads/${branch}`, sha: commit.sha });
+
+  step('PR 만들기');
+  const body = [
+    `| 항목 | 값 |`, `| --- | --- |`,
+    `| 프로젝트 | ${p.pname} (\`${p.pid}\`)${p.isNew ? ' — 새 프로젝트' : ''} |`,
+    `| 칩 | ${p.chip.name} |`,
+    `| 버전 | ${p.ver} (${up.date}) |`,
+    p.esp ? `| UART 속도 상한 | ${up.baud} |` : null,
+    embText ? `| 내장 정보 | ${embText} |` : null,
+    '', '| 파일 | 주소 | 크기 | CRC32 | SHA-256 |', '| --- | --- | ---: | --- | --- |',
+    ...images.map((i) => `| ${i.name}${i.generated ? ' (CI 생성)' : ''} | \`${hex32(parseInt(i.address, 16))}\` | ${i.bytes.length.toLocaleString()} | \`${hex32(i.crc)}\` | ${i.sha ? `\`${i.sha.slice(0, 16)}…\`` : '-'} |`),
+    '', '### fw.txt', '```ini', fwTxt.trimEnd(), '```',
+    up.notes.trim() ? `\n### 변경 내용\n${up.notes.trim()}` : null,
+    '', 'CI(Build and deploy)가 통과하면 머지하세요. 머지 후 1~2분 안에 사이트에 게시됩니다.',
+  ].filter((x) => x !== null).join('\n');
+  return gh(t, 'POST', `${repoPath}/pulls`, { title, head: branch, base: REPO.base, body });
 }
