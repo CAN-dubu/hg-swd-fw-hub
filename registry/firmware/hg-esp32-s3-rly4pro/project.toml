@@ -1,0 +1,3 @@
+name        = "HG ESP32S3 Relay4Pro"
+chip        = "esp32s3"
+description = "Higenis의 esp32s3 rly4pro 테스트 펌웨어"
