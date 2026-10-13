@@ -116,6 +116,12 @@ class RegistryTest(unittest.TestCase):
         manifest = json.loads((out / 'manifest.json').read_text('utf-8'))
         self.assertEqual(manifest['loaders'][0]['url'], None)
         # The web upload form repeats the SP check from these ranges.
+        # Asset URLs carry the build id so Pages' 10-minute cache cannot serve stale code.
+        build = manifest['build']
+        index = (out / 'index.html').read_text('utf-8')
+        for asset in ('style.css', 'app.js', 'upload.js'):
+            self.assertIn(f'{asset}?v={build}"', index)
+        self.assertIn(f'<meta name="hub-build" content="{build}">', index)
         h723 = next(c for c in manifest['chips'] if c['id'] == 'stm32h723')
         self.assertIn(['0x24000000', '0x24050000'], h723['ram'])
         for rel in ('index.html', 'fw/h723-gfx/latest.txt', 'fw/h723-gfx/1.0.0/app.bin'):
@@ -154,6 +160,14 @@ def partition_table(ota=True, app_size=0x100000):
     data = b''.join(rows)
     data += struct.pack('<H', 0xEBEB) + b'\xff' * 14 + hashlib.md5(data).digest()
     return data + b'\xff' * (0xC00 - len(data))
+
+
+def merged(boot, parts, app, boot_at=0):
+    """esptool merge-bin output: file offset = flash address, gaps filled with 0xFF."""
+    data = bytearray(b'\xff' * (0x10000 + len(app)))
+    for at, part in ((boot_at, boot), (0x8000, parts), (0x10000, app)):
+        data[at:at + len(part)] = part
+    return bytes(data)
 
 
 class EspRegistryTest(unittest.TestCase):
@@ -203,6 +217,49 @@ class EspRegistryTest(unittest.TestCase):
         self.assertIn('baud=460800\n', text)
         self.assertIn('image=bootloader.bin,0x00001000,', text)
         self.assertNotIn('ota-reset', text)
+
+    def add_merged(self, pid='rly4', chip='esp32s3', data=b''):
+        p = self.reg / 'firmware' / pid
+        (p / '1.0.0').mkdir(parents=True, exist_ok=True)
+        (p / 'project.toml').write_text(f'name = "HG-ESP32-S3-RLY4-PRO"\nchip = "{chip}"\n', 'utf-8')
+        (p / '1.0.0' / 'release.toml').write_text('date = 2026-10-07\n', 'utf-8')
+        (p / '1.0.0' / 'merged.bin').write_bytes(data)
+
+    def test_merged_image_builds_the_same_package(self):
+        boot, parts, app = esp_image(), partition_table(), esp_image(payload=b'\x22' * 3000)
+        self.add_esp(pid='split', boot=boot, parts=parts, app=app)
+        self.add_merged(data=merged(boot, parts, app))
+        manifest, files, errors = self.build()
+        self.assertEqual(errors, [])
+        for name in ('bootloader.bin', 'partitions.bin', 'firmware.bin', 'ota-reset.bin'):
+            self.assertEqual(files[f'fw/rly4/1.0.0/{name}'], files[f'fw/split/1.0.0/{name}'], name)
+        fw = files['fw/rly4/1.0.0/fw.txt'].decode('ascii').splitlines()[1:]
+        self.assertEqual(fw, files['fw/split/1.0.0/fw.txt'].decode('ascii').splitlines()[1:])
+        self.assertEqual([v['versions'][0]['merged'] for v in manifest['projects']], [True, False])
+
+    def test_merged_esp32_at_zero_or_boot_address(self):
+        boot, app = esp_image(chip_id=0), esp_image(chip_id=0)
+        image = merged(boot, partition_table(ota=False), app, boot_at=0x1000)
+        self.add_merged(pid='zero', chip='esp32', data=image)
+        self.add_merged(pid='offset', chip='esp32', data=image[0x1000:])  # merge-bin --target-offset 0x1000
+        _, files, errors = self.build()
+        self.assertEqual(errors, [])
+        self.assertEqual(files['fw/zero/1.0.0/bootloader.bin'], boot)
+        self.assertEqual(files['fw/offset/1.0.0/firmware.bin'], app)
+
+    def test_merged_rejections(self):
+        stray = bytearray(merged(esp_image(), partition_table(), esp_image()))
+        stray[0x9000] = 0  # NVS data would be dropped silently
+        self.add_merged(pid='stray', data=bytes(stray))
+        self.add_merged(pid='short', data=esp_image())
+        self.add_merged(pid='noapp', data=merged(esp_image(), partition_table(), b'\xff' * 64))
+        self.add_esp(pid='both')
+        (self.reg / 'firmware' / 'both' / '1.0.0' / 'merged.bin').write_bytes(b'')
+        manifest, _, errors = self.build()
+        self.assertEqual(manifest['projects'], [])
+        text = '\n'.join(errors)
+        for needle in ('data at 0x00009000', 'too short', 'firmware.bin at 0x00010000', 'not both'):
+            self.assertIn(needle, text)
 
     def test_rejections(self):
         bad_checksum = bytearray(esp_image(sha=False))

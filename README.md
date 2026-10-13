@@ -21,7 +21,7 @@ registry/
     └── <version>/
         ├── release.toml
         ├── app.bin                                      STM32
-        └── bootloader.bin, partitions.bin, firmware.bin ESP
+        └── bootloader.bin, partitions.bin, firmware.bin ESP (또는 merged.bin 하나)
 tools/build_registry.py        검사 + 사이트 생성 (Python 3.11+ 표준 라이브러리만 사용)
 tests/                         빌더 테스트
 web/                           정적 UI (manifest.json 렌더링, upload.js = 등록 페이지)
@@ -29,7 +29,7 @@ web/                           정적 UI (manifest.json 렌더링, upload.js = �
 
 ## 펌웨어 등록
 
-사이트의 **등록**(`#/upload`) 페이지에서 칩과 프로젝트를 고르고 BIN을 올립니다. device, 로더, 기록 주소는 칩이 정하므로 입력하지 않습니다. STM32는 `app.bin` 하나, ESP는 고정 슬롯 3개(`bootloader.bin`, `partitions.bin`, `firmware.bin`)에 올리고 UART 속도 상한을 고릅니다. 브라우저가 이미지를 검사하고 `fw.txt`를 미리 보여 준 뒤, GitHub API로 `fw/<id>-<ver>` 브랜치와 커밋 하나, PR을 만듭니다.
+사이트의 **등록**(`#/upload`) 페이지에서 칩과 프로젝트를 고르고 BIN을 올립니다. device, 로더, 기록 주소는 칩이 정하므로 입력하지 않습니다. STM32는 `app.bin` 하나, ESP는 고정 슬롯 3개(`bootloader.bin`, `partitions.bin`, `firmware.bin`)에 올리거나, 통파일(merged.bin) 하나를 올리고 UART 속도 상한을 고릅니다. 두 방식의 장단점은 파일 창에 나옵니다. 브라우저가 이미지를 검사하고 `fw.txt`를 미리 보여 준 뒤, GitHub API로 `fw/<id>-<ver>` 브랜치와 커밋 하나, PR을 만듭니다.
 
 1. PR에서 CI(`Build and deploy`)가 통과했는지 확인합니다. 브라우저 검사는 편의용이고, 최종 판단은 CI의 `build_registry.py`가 합니다.
 2. Merge 하면 main 빌드가 사이트를 다시 배포합니다.
@@ -84,6 +84,7 @@ STM32
 ESP
 
 - `bootloader.bin`, `firmware.bin`: `0xE9` 헤더, 선택한 칩의 칩 ID, 세그먼트 체크섬, 붙어 있는 SHA-256. 두 파일의 Flash 크기 설정(1~16 MiB)이 같아야 함
+- `merged.bin`(통파일): 부트로더 주소, `0x8000`, `0x10000`에서 세 파일을 잘라 위와 같이 검사. 기록하지 않는 영역(OTA data 제외)은 모두 0xFF여야 함
 - `bootloader.bin`은 `0x8000` 전에 끝나야 함. `partitions.bin`은 4 KiB 이하이며 MD5가 맞아야 함
 - 파티션 표: `0x10000`에 `firmware.bin`이 들어가는 factory/ota_0 앱. OTA data가 있으면 8 KiB여야 하며, 이때 `ota-reset.bin`(0xFF)을 생성해 app0으로 부팅하게 함
 - 이미지끼리 4 KiB 삭제 범위가 겹치지 않아야 함. `release.toml`의 `baud`는 `auto`, `921600`, `460800`, `230400`, `115200`

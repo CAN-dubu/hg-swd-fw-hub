@@ -1,7 +1,7 @@
 'use strict';
 
 const app = document.getElementById('app');
-const state = { manifest: null, query: '', chip: '', sort: 'recent', fresh: new Set(), checkedAt: 0, refreshing: false, stampEl: null };
+const state = { manifest: null, query: '', chip: '', fresh: new Set(), checkedAt: 0, refreshing: false };
 
 function h(tag, attrs, ...children) {
   const el = document.createElement(tag);
@@ -83,14 +83,6 @@ function relDate(iso) {
   return iso;
 }
 
-function relTime(ms) {
-  const s = Math.round((Date.now() - ms) / 1000);
-  if (s < 45) return '방금';
-  if (s < 3600) return `${Math.round(s / 60)}분 전`;
-  if (s < 86400) return `${Math.round(s / 3600)}시간 전`;
-  return new Date(ms).toLocaleDateString('ko-KR');
-}
-
 function countUp(el, to) {
   if (reduceMotion() || !to) { el.textContent = to; return; }
   const start = performance.now();
@@ -104,32 +96,30 @@ function countUp(el, to) {
 
 /* ---------- 목록 ---------- */
 
-const SORTS = { recent: '최근 업데이트순', name: '이름순', chip: '칩별' };
+const byRecent = (a, b) => b.updated.localeCompare(a.updated) || a.id.localeCompare(b.id);
 
 function renderList() {
   const m = state.manifest;
   const chipsInUse = m.chips.filter((c) => m.projects.some((p) => p.chip === c.id));
   if (state.chip && !chipsInUse.some((c) => c.id === state.chip)) state.chip = '';
   const results = h('div', { class: 'results' });
-  const count = h('span', { class: 'result-count' });
   const pills = [];
   let first = true;
 
   function refresh() {
     const q = state.query.trim().toLowerCase();
-    const order = {
-      recent: (a, b) => b.updated.localeCompare(a.updated) || a.id.localeCompare(b.id),
-      name: (a, b) => a.name.localeCompare(b.name, 'ko'),
-      chip: (a, b) => chipOf(a.chip).name.localeCompare(chipOf(b.chip).name) || a.name.localeCompare(b.name, 'ko'),
-    }[state.sort];
-    const list = [...m.projects].sort(order).filter((p) =>
+    const list = m.projects.filter((p) =>
       (!state.chip || p.chip === state.chip) &&
-      (!q || [p.id, p.name, p.description, chipOf(p.chip).name].join(' ').toLowerCase().includes(q)));
+      (!q || [p.id, p.name, p.description, chipOf(p.chip).name].join(' ').toLowerCase().includes(q))).sort(byRecent);
     pills.forEach((b) => { const on = b.dataset.chip === state.chip; b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on)); });
-    count.textContent = list.length === m.projects.length ? `${list.length}개` : `${list.length} / ${m.projects.length}개`;
+    // 칩마다 한 줄: 최근에 바뀐 칩이 위로
+    const shelves = chipsInUse.map((c) => [c, list.filter((p) => p.chip === c.id)]).filter(([, ps]) => ps.length)
+      .sort(([, a], [, b]) => byRecent(a[0], b[0]));
     // 처음엔 하나씩 떠오르고, 필터를 바꿀 때는 짧게 페이드만 한다
-    results.replaceChildren(list.length
-      ? h('div', { class: 'grid' }, list.map((p, i) => card(p, first ? 'rise' : 'fade', i)))
+    let i = 0;
+    const anim = first ? 'rise' : 'fade';
+    results.replaceChildren(shelves.length
+      ? h('div', { class: 'shelves' }, shelves.map(([c, ps]) => shelf(c, ps, anim, () => i++)))
       : h('div', { class: 'none fade' },
           h('p', {}, '조건에 맞는 펌웨어가 없습니다.'),
           h('button', { type: 'button', class: 'btn', onclick: () => { state.query = ''; state.chip = ''; search.value = ''; refresh(); } }, '필터 초기화')));
@@ -148,87 +138,89 @@ function renderList() {
     class: 'search', type: 'search', placeholder: '이름, ID, 칩 검색', value: state.query, 'aria-label': '검색',
     oninput: (e) => { state.query = e.target.value; refresh(); },
   });
-  const pill = (id, label, n) => {
-    const b = h('button', { type: 'button', class: 'pill', 'data-chip': id, onclick: () => { state.chip = id; refresh(); } },
-      label, h('span', { class: 'pill-n' }, n));
+  const pill = (id, label, kind) => {
+    const b = h('button', { type: 'button', class: `pill${kind ? ` k-${kind}` : ''}`, 'data-chip': id, onclick: () => { state.chip = id; refresh(); } }, label);
     pills.push(b);
     return b;
   };
-  const sort = h('select', { class: 'sort', 'aria-label': '정렬', onchange: (e) => { state.sort = e.target.value; refresh(); } },
-    Object.entries(SORTS).map(([k, label]) => h('option', { value: k }, label)));
-  sort.value = state.sort;
 
-  const statEls = [['프로젝트', m.projects.length], ['버전', m.projects.reduce((n, p) => n + p.versions.length, 0)], ['지원 칩', m.chips.length]]
-    .map(([label, value]) => ({ value, dd: h('dd', {}, '0'), label }));
-  state.stampEl = h('span', { class: 'stamp' });
+  const stats = [['folder', '프로젝트', m.projects.length], ['chip', '지원 칩', m.chips.length]]
+    .map(([ico, label, value]) => ({ ico, label, value, n: h('b', { class: 'stat-n' }, '0') }));
 
   app.replaceChildren(...[
     h('section', { class: 'hero' },
-      h('p', { class: 'eyebrow' }, 'HG-SWD-PROG · Firmware Hub'),
-      h('h1', {}, '펌웨어 저장소'),
-      h('p', { class: 'lead' }, '오프라인 프로그래머에 넣을 펌웨어를 칩별로 모아 둔 곳입니다. SD 패키지를 받아 카드에 풀면 바로 기록할 수 있습니다.'),
-      h('div', { class: 'hero-row' },
-        h('dl', { class: 'stats' }, statEls.map((s) => h('div', { class: 'stat' }, h('dt', {}, s.label), s.dd))),
-        state.stampEl)),
+      h('div', { class: 'hero-text' },
+        h('h1', {}, '펌웨어 저장소'),
+        h('p', { class: 'lead' }, 'SD 패키지를 받아 카드에 풀면 바로 기록할 수 있습니다.')),
+      h('div', { class: 'stats' }, stats.map((s) => h('div', { class: 'stat' }, icon(s.ico, 'stat-ico'), s.n, h('span', { class: 'stat-label' }, s.label))))),
     m.projects.length ? h('div', { class: 'toolbar' },
       h('div', { class: 'search-wrap' }, search, h('kbd', { class: 'kbd', title: '/ 키로 검색' }, '/')),
       h('div', { class: 'pills', role: 'group', 'aria-label': '칩 필터' },
-        pill('', '전체', m.projects.length),
-        chipsInUse.map((c) => pill(c.id, c.name, m.projects.filter((p) => p.chip === c.id).length))),
-      h('div', { class: 'toolbar-end' }, count, sort)) : null,
+        pill('', '전체'),
+        chipsInUse.map((c) => pill(c.id, c.name, kindOf(c))))) : null,
     body].filter(Boolean));
-  statEls.forEach((s) => countUp(s.dd, s.value));
+  stats.forEach((s) => countUp(s.n, s.value));
   updateStamp();
   if (m.projects.length) refresh();
 }
 
+/* 칩 한 줄: 왼쪽에 칩, 오른쪽에 그 칩의 펌웨어 카드 */
+function shelf(chip, projects, anim, nextI) {
+  const kind = kindOf(chip);
+  return h('section', { class: `shelf k-${kind}` },
+    h('header', { class: `shelf-head ${anim}`, style: `--i:${Math.min(nextI(), 12)}` },
+      icon('chip', 'shelf-ico'),
+      h('div', { class: 'shelf-title' }, h('h2', {}, chip.name), h('span', {}, `${IFACE[kind]} · ${projects.length}개`))),
+    h('div', { class: 'shelf-cards' }, projects.map((p) => card(p, anim, nextI()))));
+}
+
 function card(p, anim, i) {
   const v = p.versions.find((x) => x.version === p.latest);
-  const chip = chipOf(p.chip);
   const go = () => { location.hash = `#/p/${p.id}`; };
   const fresh = state.fresh.has(p.id);
   return h('article', {
-    class: `card k-${kindOf(chip)} ${anim}${fresh ? ' fresh' : ''}`, style: `--i:${Math.min(i, 12)}`, tabindex: '0',
+    class: `card ${anim}${fresh ? ' fresh' : ''}`, style: `--i:${Math.min(i, 12)}`, tabindex: '0', title: `${p.name} 자세히 보기`,
     onclick: go, onkeydown: (e) => { if (e.key === 'Enter') go(); },
   },
-    h('div', { class: 'card-top' },
-      chipBadge(chip),
-      h('span', { class: 'ver' },
-        fresh ? h('span', { class: 'tag ok pop' }, '방금 반영') : daysAgo(p.updated) < 7 ? h('span', { class: 'tag new' }, 'NEW') : null,
-        `v${p.latest}`)),
-    h('h3', {}, p.name),
-    h('code', { class: 'pid' }, p.id),
+    h('h3', {}, p.name,
+      fresh ? h('span', { class: 'tag ok pop' }, '방금 반영') : daysAgo(p.updated) < 7 ? h('span', { class: 'tag new' }, 'NEW') : null),
     p.description ? h('p', { class: 'desc' }, p.description) : null,
-    h('div', { class: 'meta' },
-      h('span', {}, fmtSize(v.size)),
-      h('span', {}, v.images.length > 1 ? `${v.images.length}개 이미지` : `${v.erase.count} 섹터`),
-      h('span', { title: v.date }, relDate(v.date)),
-      p.versions.length > 1 ? h('span', {}, `${p.versions.length}개 버전`) : null),
-    downloads(v, true));
+    h('div', { class: 'card-foot' },
+      h('span', { class: 'ver' }, `v${p.latest}`),
+      h('span', { class: 'when', title: v.date }, relDate(v.date)),
+      h('a', { class: 'btn primary sd-btn', href: v.sd_zip.url, download: '', onclick: stop, title: `SD 패키지 ${fmtSize(v.sd_zip.size)}` },
+        icon('download'), 'SD 패키지')),
+    icon('chevron', 'card-go'));
 }
 
 /* ---------- 새로고침 ---------- */
 
 function updateStamp() {
-  const m = state.manifest;
-  if (state.stampEl?.isConnected) {
-    state.stampEl.replaceChildren(
-      h('span', { class: 'dot' }), `사이트 빌드 ${relTime(new Date(m.generated).getTime())}`,
-      h('span', { class: 'sep' }, '·'), `확인 ${relTime(state.checkedAt)}`);
-  }
-  const gen = new Date(m.generated);
+  const gen = new Date(state.manifest.generated);
   document.getElementById('generated').textContent = isNaN(gen) ? '' : `갱신 ${gen.toLocaleString('ko-KR')}`;
 }
 
-function toast(text, kind = '') {
+/* action = { label, onclick }이 있으면 버튼을 달고 사용자가 누를 때까지 남겨 둔다 */
+function toast(text, kind = '', action = null) {
   const box = document.getElementById('toasts');
-  const t = h('div', { class: `toast ${kind}`, role: 'status' }, text);
+  const t = h('div', { class: `toast ${kind}`, role: 'status' }, text,
+    action ? h('button', { type: 'button', class: 'toast-btn', onclick: action.onclick }, action.label) : null);
   box.append(t);
+  if (action) return;
   setTimeout(() => {
     t.classList.add('out');
     t.addEventListener('animationend', () => t.remove(), { once: true });
     setTimeout(() => t.remove(), 600);
   }, 3600);
+}
+
+/* 열어 둔 페이지가 예전 사이트 코드면 새로고침을 권한다 (Pages가 파일을 10분 캐시함) */
+function checkSiteBuild(m) {
+  const mine = document.querySelector('meta[name="hub-build"]')?.content;
+  if (!mine || !m.build || m.build === mine) return false;
+  if (!state.buildNotified) toast('사이트가 업데이트되었습니다', 'info', { label: '새로고침', onclick: () => location.reload() });
+  state.buildNotified = true;
+  return true;
 }
 
 async function fetchManifest() {
@@ -254,6 +246,7 @@ async function refreshManifest({ silent = false } = {}) {
     const removed = [...prev.keys()].some((id) => !next.projects.some((p) => p.id === id));
     state.manifest = next;
     state.checkedAt = Date.now();
+    const siteChanged = checkSiteBuild(next);
     const changed = [...added, ...bumped.map((p) => p.id)];
     if (changed.length || removed) {
       changed.forEach((id) => state.fresh.add(id));
@@ -263,10 +256,11 @@ async function refreshManifest({ silent = false } = {}) {
       setTimeout(() => {
         changed.forEach((id) => state.fresh.delete(id));
         app.querySelectorAll('.card.fresh').forEach((c) => c.classList.remove('fresh'));
+        app.querySelectorAll('.card .tag.ok').forEach((t) => t.remove());
       }, 6000);
     } else {
       updateStamp();
-      if (!silent) toast('이미 최신 상태입니다');
+      if (!silent && !siteChanged) toast('이미 최신 상태입니다');
     }
   } catch (e) {
     if (!silent) toast(`새로고침 실패: ${e.message}`, 'err');
@@ -398,6 +392,7 @@ async function init() {
   try {
     state.manifest = await fetchManifest();
     state.checkedAt = Date.now();
+    checkSiteBuild(state.manifest);
   } catch (e) {
     app.replaceChildren(h('div', { class: 'empty' }, h('h3', {}, 'manifest.json을 불러오지 못했습니다'), h('p', { class: 'muted' }, String(e)),
       h('button', { type: 'button', class: 'btn', onclick: () => location.reload() }, '다시 시도')));
@@ -416,7 +411,6 @@ async function init() {
       search.focus();
     }
   });
-  setInterval(updateStamp, 30000);
   render();
   updateStamp();
 }

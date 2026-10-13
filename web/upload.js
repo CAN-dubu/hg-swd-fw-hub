@@ -13,7 +13,8 @@ const VER_MAGIC = 0x56455220;
 const ESP_SECTOR = 0x1000;
 const ESP_APP_DESC_MAGIC = 0xABCD5432;
 
-const up = { chip: '', project: '', id: '', name: '', desc: '', image: null, esp: {}, baud: 'auto', version: '', date: '', notes: '', token: null, busy: false };
+const up = { chip: '', project: '', id: '', name: '', desc: '', image: null, esp: {}, espMode: 'split', merged: null, mergedSplit: null,
+  baud: 'auto', version: '', date: '', notes: '', token: null, busy: false };
 
 /* ---------- 계산 ---------- */
 
@@ -141,6 +142,52 @@ async function espAppendedHashOk(b) {
   return (await sha256(b.subarray(0, end))) === toHex(b.subarray(end, end + 32));
 }
 
+/* 이미지가 차지하는 길이: 세그먼트, 체크섬 패딩, 붙은 SHA-256. 형식이 깨졌으면 -1 (build_registry.esp_image_length) */
+function espImageLength(b) {
+  const end = espImageEnd(b);
+  if (end < 0) return -1;
+  return b[23] ? Math.min(end + 32, b.length) : end; // 잘린 해시는 inspectEspImage가 불일치로 알린다
+}
+
+/* 통파일(esptool merge-bin)의 파일 위치 0이 가리키는 Flash 주소. --target-offset으로 부트로더부터 합친 경우도 받는다 */
+const mergedBase = (b, chip) => {
+  const boot = parseInt(chip.slots[0].address, 16);
+  return boot && b[0] === 0xE9 ? boot : 0;
+};
+
+/* 3분할 칸에 통파일을 놓았는지: 0x8000에 파티션 표, 0x10000에 앱 이미지 */
+function looksMerged(b, chip) {
+  const base = mergedBase(b, chip);
+  return b.length > 0x10000 - base + 24 && b[0x10000 - base] === 0xE9 && view(b).getUint16(0x8000 - base, true) === 0x50AA;
+}
+
+/* build_registry.split_esp_merged: 통파일을 세 칸 파일로 자른다 */
+async function splitMerged(file, chip) {
+  const b = file.bytes;
+  const base = mergedBase(b, chip);
+  if (b.length <= 0x10000 - base + 24) return { error: '0x10000의 firmware까지 들어 있는 통파일이 아님' };
+  const parts = {};
+  for (const s of chip.slots) {
+    const off = parseInt(s.address, 16) - base;
+    const len = s.name === 'partitions.bin' ? 0xC00 : espImageLength(b.subarray(off));
+    if (len < 0) return { error: `${s.address}에 ${s.name} 이미지가 없음` };
+    const bytes = b.slice(off, off + len);
+    parts[s.name] = { name: `${file.name} @ ${s.address}`, bytes, crc: crc32(bytes), sha: await sha256(bytes), hashOk: await espAppendedHashOk(bytes) };
+  }
+  return { base, parts };
+}
+
+/* build_registry.check_merged_rest: 기록하지 않는 영역에 데이터가 있으면 그 주소, 없으면 -1 */
+function mergedStray(b, base, images) {
+  const ranges = images.map((i) => [parseInt(i.address, 16) - base, parseInt(i.address, 16) - base + i.bytes.length]).sort((x, y) => x[0] - y[0]);
+  let pos = 0;
+  for (const [lo, hi] of [...ranges, [b.length, b.length]]) {
+    for (let i = pos; i < lo; i++) if (b[i] !== 0xFF) return base + i;
+    pos = Math.max(pos, hi);
+  }
+  return -1;
+}
+
 function inspectEspImage(file, chipId) {
   const b = file.bytes;
   if (b.length < 24 || b[0] !== 0xE9 || b[1] < 1 || b[1] > 16) return { error: 'ESP 이미지 헤더가 아님 (0xE9)' };
@@ -247,15 +294,22 @@ function planStm32(chip, pname) {
   return out;
 }
 
-/* ESP: 고정 슬롯 3개 + 파티션 표에 OTA data가 있으면 ota-reset.bin 생성. HG-SWD-PROG esp_project.c가 읽는 fw.txt */
+/* ESP: 고정 슬롯 3개(또는 그걸 자른 통파일) + 파티션 표에 OTA data가 있으면 ota-reset.bin 생성.
+   HG-SWD-PROG esp_project.c가 읽는 fw.txt */
 function planEsp(chip, pname) {
   const out = { checks: [], slotChecks: {}, images: [], fwTxt: null, error: null, embedded: null, upload: [] };
-  const f = Object.fromEntries(chip.slots.map((s) => [s.name, up.esp[s.name] || null]));
+  const merged = up.espMode === 'merged';
+  const src = merged ? up.mergedSplit?.parts || {} : up.esp;
+  const f = Object.fromEntries(chip.slots.map((s) => [s.name, src[s.name] || null]));
   const sc = (name, cls, text) => (out.slotChecks[name] = out.slotChecks[name] || []).push([cls, text]);
   const fail = (msg) => { out.error = out.error || msg; };
   const boot = f['bootloader.bin'], parts = f['partitions.bin'], app = f['firmware.bin'];
   const bootAddr = parseInt(chip.slots[0].address, 16);
-  out.upload = chip.slots.map((s) => [s.name, f[s.name]?.bytes ?? null]);
+  out.upload = merged ? [['merged.bin', up.merged?.bytes ?? null]] : chip.slots.map((s) => [s.name, f[s.name]?.bytes ?? null]);
+  if (merged) {
+    if (!up.merged) { fail('통파일을 선택하세요'); return out; }
+    if (up.mergedSplit?.error) { out.checks.push(['err', up.mergedSplit.error]); fail(up.mergedSplit.error); return out; }
+  }
 
   let flash = null;
   if (boot) {
@@ -290,7 +344,7 @@ function planEsp(chip, pname) {
   if (missing.length) fail(`${missing.join(', ')}을(를) 선택하세요`);
   if (out.error) return out;
 
-  const images = chip.slots.map((s) => ({ ...f[s.name], source: f[s.name].name, name: s.name, address: s.address }));
+  const images = chip.slots.map((s) => ({ ...f[s.name], source: merged ? 'merged.bin' : f[s.name].name, name: s.name, address: s.address }));
   if (ota) {
     const bytes = new Uint8Array(ota.size).fill(0xFF);
     images.push({ name: 'ota-reset.bin', address: hex32(ota.addr), bytes, crc: crc32(bytes), generated: true });
@@ -301,6 +355,10 @@ function planEsp(chip, pname) {
     const addr = parseInt(img.address, 16);
     if (addr < prevEnd) return { ...out, error: `${img.name}가 앞 이미지의 삭제 범위와 겹침` };
     prevEnd = addr + Math.ceil(img.bytes.length / ESP_SECTOR) * ESP_SECTOR;
+  }
+  if (merged) {
+    const stray = mergedStray(up.merged.bytes, up.mergedSplit.base, images);
+    if (stray >= 0) return { ...out, checks: [['err', `${hex32(stray)}에 기록되지 않을 데이터가 있음 (NVS·SPIFFS 등). 3분할로 올리세요`]], error: '통파일에 다른 데이터가 있음' };
   }
   out.images = images;
   out.erase = `${images.reduce((n, i) => n + Math.ceil(i.bytes.length / ESP_SECTOR), 0)} × 4 KiB`;
@@ -368,6 +426,7 @@ const ICONS = {
   check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
   alert: '<path d="M12 8v5M12 16.5v.5"/><circle cx="12" cy="12" r="9"/>',
   upload: '<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
+  download: '<path d="M12 4v12M7 11l5 5 5-5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
   chevron: '<path d="M9 6l6 6-6 6"/>',
 };
 
@@ -472,8 +531,32 @@ function planUpload() {
 
 const selectionReady = (p) => !p.errors.chip && !p.errors.project && !p.errors.image;
 
+/* 파일 칸: [고른 수, 필요한 수]. ESP 통파일은 1개 */
+function fileProgress(chip) {
+  if (chip.kind !== 'esp') return [up.image ? 1 : 0, 1];
+  if (up.espMode === 'merged') return [up.merged ? 1 : 0, 1];
+  return [Object.keys(up.esp).length, chip.slots.length];
+}
+
+const clearFiles = () => Object.assign(up, { image: null, esp: {}, merged: null, mergedSplit: null });
+
+/* ESP 올리는 방식. 장단점은 파일 창에서 고를 때 보여 준다 */
+const ESP_MODES = {
+  split: {
+    title: '3분할 파일', sub: 'bootloader · partitions · firmware',
+    pros: ['빌드 폴더 결과물을 그대로 사용', '파일마다 검사 결과를 따로 확인'],
+    cons: ['세 파일을 모두 골라야 함', '다른 빌드의 파일이 섞일 수 있음'],
+  },
+  merged: {
+    title: '통파일 1개', sub: 'merged.bin · esptool merge-bin',
+    pros: ['파일 하나로 끝, 빌드 간 혼용 없음', '받은 원본 그대로 저장소에 보관'],
+    cons: ['0x0부터 합친 파일만 가능', 'NVS·SPIFFS 등 다른 데이터가 있으면 불가', '빈 영역(0xFF)만큼 파일이 조금 큼'],
+  },
+};
+
 function resetUpload(keepToken = true) {
-  Object.assign(up, { chip: '', project: '', id: '', name: '', desc: '', image: null, esp: {}, baud: 'auto', version: '', notes: '',
+  clearFiles();
+  Object.assign(up, { chip: '', project: '', id: '', name: '', desc: '', baud: 'auto', version: '', notes: '',
     date: new Date().toLocaleDateString('sv-SE') });
   if (!keepToken) up.token = loadToken();
 }
@@ -512,14 +595,14 @@ function renderUpload() {
   function refresh() {
     const p = planUpload();
     const chip = p.chip;
-    const fileCount = chip?.kind === 'esp' ? Object.keys(up.esp).length : up.image ? 1 : 0;
+    const [fileCount, need] = chip ? fileProgress(chip) : [0, 1];
     const slotError = Object.values(p.pkg.slotChecks).flat().some(([c]) => c === 'err') || p.pkg.checks.some(([c]) => c === 'err');
-    const partial = chip?.kind === 'esp' && fileCount < chip.slots.length && !slotError;
+    const partial = fileCount < need && !slotError;
     const fileState = !fileCount ? '' : partial ? 'partial' : p.errors.image ? 'bad' : 'done';
     const fileValue = !fileCount ? '파일 선택'
-      : chip.kind === 'esp' ? `파일 ${fileCount} / ${chip.slots.length}` : up.image.name;
-    const fileSub = !fileCount ? (chip?.kind === 'esp' ? 'bootloader · partitions · firmware' : chip ? 'BIN 파일 하나' : '')
-      : partial ? `${chip.slots.length - fileCount}개 더 필요` : p.errors.image ? p.errors.image : `${fmtSize(p.pkg.images.reduce((n, i) => n + i.bytes.length, 0))} · 검사 통과`;
+      : need > 1 ? `파일 ${fileCount} / ${need}` : (chip.kind === 'esp' ? up.merged : up.image).name;
+    const fileSub = !fileCount ? (chip?.kind === 'esp' ? ESP_MODES[up.espMode].sub : chip ? 'BIN 파일 하나' : '')
+      : partial ? `${need - fileCount}개 더 필요` : p.errors.image ? p.errors.image : `${fmtSize(p.pkg.images.reduce((n, i) => n + i.bytes.length, 0))} · 검사 통과`;
 
     tiles.replaceChildren(
       tile('1', 'chip', '칩', chip
@@ -547,14 +630,14 @@ function renderUpload() {
   /* ① 칩 */
   function openChip() {
     const groups = [['stm32', 'STM32 · SWD', '내부 Flash에 SWD로 기록합니다. ST 로더를 사용합니다.'],
-      ['esp', 'ESP32 · UART', '부트로더·파티션·앱 세 파일을 UART로 기록합니다.']];
+      ['esp', 'ESP32 · UART', '부트로더·파티션·앱을 UART로 기록합니다. 3분할 또는 통파일로 올립니다.']];
     const modal = openModal('칩 선택', {
       body: h('div', { class: 'opt-list' }, groups.map(([kind, title, desc]) => {
         const chips = m.chips.filter((c) => (c.kind || 'stm32') === kind);
         return chips.length ? [h('div', { class: 'opt-group' }, h('b', {}, title), h('span', {}, desc)),
           chips.map((c) => option(c.name, kind === 'esp' ? `${c.device} · 부트로더 ${c.slots[0].address}` : `${c.device} · Flash ${fmtSize(c.flash_size)}`,
             `k-${kind}`, up.chip === c.id, () => {
-              if (up.chip !== c.id) { up.project = ''; up.image = null; up.esp = {}; }
+              if (up.chip !== c.id) { up.project = ''; clearFiles(); }
               up.chip = c.id;
               modal.close();
               refresh();
@@ -575,7 +658,7 @@ function renderUpload() {
       up.version = suggestVersion(m.projects.find((p) => p.id === id));
       modal.close();
       refresh();
-      if (!(chip.kind === 'esp' ? Object.keys(up.esp).length : up.image)) setTimeout(openFiles, reduceMotion() ? 0 : 200);
+      if (!fileProgress(chip)[0]) setTimeout(openFiles, reduceMotion() ? 0 : 200);
     };
 
     function newForm() {
@@ -594,7 +677,7 @@ function renderUpload() {
         up.version = '1.0.0';
         modal.close();
         refresh();
-        if (!(chip.kind === 'esp' ? Object.keys(up.esp).length : up.image)) setTimeout(openFiles, reduceMotion() ? 0 : 200);
+        if (!fileProgress(chip)[0]) setTimeout(openFiles, reduceMotion() ? 0 : 200);
       } }, '이 프로젝트로 만들기');
       function check(force) {
         const saved = up.project;
@@ -631,12 +714,22 @@ function renderUpload() {
     const done = h('button', { type: 'button', class: 'btn primary', onclick: () => modal.close() }, '완료');
     const modal = openModal(esp ? '펌웨어 파일 (ESP)' : '펌웨어 파일', { body, footer: done, wide: esp });
 
+    let note = '';
+
     async function take(files) {
       for (const f of files) {
-        const slot = esp ? espSlotFor(f.name) : 'app';
-        if (!slot) continue;
         const read = await readFile(f);
-        if (esp) up.esp[slot] = read; else up.image = read;
+        if (!esp) { up.image = read; continue; }
+        // 3분할 칸에 통파일을 놓으면 방식을 바꿔 준다
+        if (up.espMode === 'merged' || looksMerged(read.bytes, chip)) {
+          if (up.espMode !== 'merged') note = `${f.name}은(는) 통파일이라 통파일 방식으로 바꿨습니다.`;
+          up.espMode = 'merged';
+          up.merged = read;
+          up.mergedSplit = await splitMerged(read, chip);
+          break;
+        }
+        const slot = espSlotFor(f.name);
+        if (slot) up.esp[slot] = read;
       }
       draw();
       refresh();
@@ -645,40 +738,58 @@ function renderUpload() {
     function draw() {
       const p = planUpload();
       const list = (items) => h('ul', { class: 'checks' }, items.map(checkItem));
+      const picked = (file, onReplace) => h('div', { class: 'picked' }, icon('file', 'picked-ico'), h('div', {}, h('b', {}, file.name),
+        h('span', { class: 'muted' }, ` ${fmtSize(file.bytes.length)}`)), h('button', { type: 'button', class: 'link-btn', onclick: onReplace }, '바꾸기'));
       if (!esp) {
         put(body,
           up.image
-            ? h('div', { class: 'picked' }, icon('file', 'picked-ico'), h('div', {}, h('b', {}, up.image.name),
-                h('span', { class: 'muted' }, ` ${fmtSize(up.image.bytes.length)}`)), h('button', { type: 'button', class: 'link-btn', onclick: () => { up.image = null; draw(); refresh(); } }, '바꾸기'))
+            ? picked(up.image, () => { up.image = null; draw(); refresh(); })
             : dropZone(take, { title: 'BIN 파일을 끌어다 놓거나 눌러서 선택', hint: `${chip.flash_base}부터 시작하는 전체 이미지 · 최대 ${fmtSize(chip.flash_size)}` }),
           p.pkg.checks.length ? list(p.pkg.checks) : null);
-      } else {
-        const filled = Object.keys(up.esp).length;
-        put(body,
-          filled < chip.slots.length
+        done.textContent = p.errors.image ? '닫기' : '완료';
+        return;
+      }
+      const merged = up.espMode === 'merged';
+      const src = merged ? up.mergedSplit?.parts || {} : up.esp;
+      const modes = h('div', { class: 'mode-pick', role: 'radiogroup', 'aria-label': '올리는 방식' }, Object.entries(ESP_MODES).map(([k, m]) => {
+        const on = up.espMode === k;
+        return h('button', { type: 'button', role: 'radio', 'aria-checked': String(on), class: `mode${on ? ' sel' : ''}`,
+          onclick: () => { if (!on) { up.espMode = k; note = ''; draw(); refresh(); } } },
+          h('span', { class: 'mode-head' }, h('span', { class: 'mode-radio' }), h('b', {}, m.title)),
+          h('span', { class: 'mode-sub' }, m.sub),
+          h('ul', { class: 'pc' }, m.pros.map((t) => h('li', { class: 'pro' }, h('span', {}, t))), m.cons.map((t) => h('li', { class: 'con' }, h('span', {}, hexify(t))))));
+      }));
+      const rows = h('div', { class: 'slot-list' + (merged ? ' derived' : '') }, chip.slots.map((s) => {
+        const f = src[s.name];
+        const checks = p.pkg.slotChecks[s.name] || [];
+        const bad = checks.some(([c]) => c === 'err');
+        return h('div', { class: `slot-row ${f ? (bad ? 'bad' : 'done') : ''}` },
+          h('span', { class: 'slot-state' }, f ? icon(bad ? 'alert' : 'check') : icon('file')),
+          h('div', { class: 'slot-main' },
+            h('div', {}, h('b', {}, s.name), h('code', { class: 'slot-addr' }, s.address)),
+            f ? h('span', { class: 'muted' }, merged ? `통파일에서 분리 · ${fmtSize(f.bytes.length)}` : `${f.name} · ${fmtSize(f.bytes.length)}`)
+              : h('span', { class: 'muted' }, merged ? '통파일을 고르면 채워집니다' : '비어 있음'),
+            checks.length ? list(checks) : null),
+          merged ? null : h('label', { class: 'btn slot-pick' }, f ? '바꾸기' : '선택',
+            h('input', { type: 'file', accept: '.bin', hidden: true, onchange: async (e) => {
+              if (!e.target.files[0]) return;
+              up.esp[s.name] = await readFile(e.target.files[0]);
+              draw();
+              refresh();
+            } })));
+      }));
+      put(body,
+        modes,
+        note ? h('p', { class: 'mode-note' }, icon('alert'), note) : null,
+        merged
+          ? (up.merged ? picked(up.merged, () => { up.merged = null; up.mergedSplit = null; draw(); refresh(); })
+            : dropZone(take, { title: '통파일을 끌어다 놓거나 눌러서 선택', hint: '0x0부터 합친 이미지 (idf.py merge-bin, Arduino의 merged.bin)' }))
+          : Object.keys(up.esp).length < chip.slots.length
             ? dropZone(take, { multiple: true, title: '세 파일을 한 번에 끌어다 놓으세요', hint: '파일 이름을 보고 아래 칸에 자동으로 넣습니다' })
             : null,
-          h('div', { class: 'slot-list' }, chip.slots.map((s) => {
-            const f = up.esp[s.name];
-            const checks = p.pkg.slotChecks[s.name] || [];
-            const bad = checks.some(([c]) => c === 'err');
-            return h('div', { class: `slot-row ${f ? (bad ? 'bad' : 'done') : ''}` },
-              h('span', { class: 'slot-state' }, f ? icon(bad ? 'alert' : 'check') : icon('file')),
-              h('div', { class: 'slot-main' },
-                h('div', {}, h('b', {}, s.name), h('code', { class: 'slot-addr' }, s.address)),
-                f ? h('span', { class: 'muted' }, `${f.name} · ${fmtSize(f.bytes.length)}`) : h('span', { class: 'muted' }, '비어 있음'),
-                checks.length ? list(checks) : null),
-              h('label', { class: 'btn slot-pick' }, f ? '바꾸기' : '선택',
-                h('input', { type: 'file', accept: '.bin', hidden: true, onchange: async (e) => {
-                  if (!e.target.files[0]) return;
-                  up.esp[s.name] = await readFile(e.target.files[0]);
-                  draw();
-                  refresh();
-                } })));
-          })),
-          h('p', { class: 'hint' }, 'ota-reset.bin은 올리지 않아도 됩니다. 파티션에 OTA 영역이 있으면 자동으로 만듭니다.'),
-          p.pkg.checks.length ? list(p.pkg.checks) : null);
-      }
+        p.pkg.checks.length ? list(p.pkg.checks) : null,
+        rows,
+        h('p', { class: 'hint' }, 'ota-reset.bin은 올리지 않아도 됩니다. 파티션에 OTA 영역이 있으면 자동으로 만듭니다.'));
       done.textContent = p.errors.image ? '닫기' : '완료';
     }
     draw();
@@ -708,7 +819,8 @@ function renderUpload() {
       h('div', {}, h('dt', {}, '칩'), h('dd', {}, chipBadge(p.chip))),
       h('div', {}, h('dt', {}, '프로젝트'), h('dd', {}, p.pname, h('code', {}, p.pid), p.isNew ? h('span', { class: 'tag ok' }, '새로 만들기') : null)),
       h('div', {}, h('dt', {}, '파일'), h('dd', {}, p.pkg.images.map((i) => h('span', { class: 'file-chip' }, i.name, i.generated ? ' (자동)' : '')),
-        h('span', { class: 'muted' }, ` 총 ${fmtSize(p.pkg.images.reduce((n, i) => n + i.bytes.length, 0))}`))));
+        h('span', { class: 'muted' }, ` 총 ${fmtSize(p.pkg.images.reduce((n, i) => n + i.bytes.length, 0))}`),
+        p.esp && up.espMode === 'merged' ? h('span', { class: 'muted' }, ` · 통파일 ${up.merged.name}에서 분리`) : null)));
     const preview = h('pre', { class: 'code' });
     const commitList = h('ul', { class: 'files' });
 
@@ -873,6 +985,7 @@ async function submitPlan(p, step) {
     `| 칩 | ${p.chip.name} |`,
     `| 버전 | ${p.ver} (${up.date}) |`,
     p.esp ? `| UART 속도 상한 | ${up.baud} |` : null,
+    p.esp ? `| 올린 형식 | ${up.espMode === 'merged' ? `통파일 \`merged.bin\` (${up.merged.name})` : '3분할'} |` : null,
     embText ? `| 내장 정보 | ${embText} |` : null,
     '', '| 파일 | 주소 | 크기 | CRC32 | SHA-256 |', '| --- | --- | ---: | --- | --- |',
     ...images.map((i) => `| ${i.name}${i.generated ? ' (CI 생성)' : ''} | \`${hex32(parseInt(i.address, 16))}\` | ${i.bytes.length.toLocaleString()} | \`${hex32(i.crc)}\` | ${i.sha ? `\`${i.sha.slice(0, 16)}…\`` : '-'} |`),

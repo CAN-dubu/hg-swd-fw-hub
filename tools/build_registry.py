@@ -34,6 +34,8 @@ VER_OFFSET, VER_MAGIC = 0x400, 0x56455220          # STM32 'VER ' image header
 ESP_BAUDS = ('auto', '115200', '230400', '460800', '921600')
 ESP_SECTOR = 0x1000
 ESP_APP_DESC_MAGIC = 0xABCD5432
+ESP_MERGED = 'merged.bin'                          # one flash image instead of the three slot files
+ESP_PART_TABLE = 0xC00                             # partition table size written by ESP-IDF
 CHIP_FIELDS = {
     'stm32': ('name', 'device', 'loader', 'flash_base', 'flash_size', 'sector_size', 'ram'),
     'esp': ('name', 'device', 'chip_id', 'boot_address'),
@@ -239,34 +241,96 @@ def esp_app_desc(app: bytes) -> dict | None:
     return {'version': cstr(app[48:80]), 'name': cstr(app[80:112]), 'idf': cstr(app[144:176])}
 
 
+def esp_image_length(data: bytes) -> int:
+    """Bytes an ESP image occupies: segments, padded checksum and the appended SHA-256, if flagged."""
+    if len(data) < 24 or data[0] != 0xE9 or not 1 <= data[1] <= 16:
+        raise RegistryError('no ESP image here (0xE9 header)')
+    offset = 24
+    for _ in range(data[1]):
+        if offset + 8 > len(data):
+            raise RegistryError('truncated segment header')
+        offset += 8 + struct.unpack_from('<I', data, offset + 4)[0]
+    end = (offset + 16) & ~15
+    if end > len(data):
+        raise RegistryError('truncated segment data')
+    # A short hash is cut here and reported by inspect_esp_image as a SHA-256 mismatch.
+    return min(end + 32, len(data)) if data[23] else end
+
+
+def split_esp_merged(data: bytes, chip: dict) -> tuple[int, dict[str, bytes]]:
+    """Cut a merged flash image (esptool merge-bin) into the three slot files.
+
+    File offset 0 is flash 0x0, or the boot address when merged with --target-offset.
+    Returns that base address and the slot files.
+    """
+    boot = chip['boot_address']
+    base = boot if boot and data[:1] == b'\xe9' else 0
+    if len(data) <= 0x10000 - base + 24:
+        raise RegistryError('too short: a merged image must reach firmware at 0x10000')
+    files = {}
+    for name, address in esp_slots(chip):
+        off = address - base
+        try:
+            size = ESP_PART_TABLE if name == 'partitions.bin' else esp_image_length(data[off:])
+        except RegistryError as e:
+            raise RegistryError(f'{name} at {hex32(address)}: {e}') from None
+        files[name] = data[off:off + size]
+    return base, files
+
+
+def check_merged_rest(data: bytes, base: int, images: list) -> None:
+    """Everything outside the written images must be blank, or it would silently go missing."""
+    pos = 0
+    for lo, hi in sorted((a - base, a - base + len(i)) for _, a, i in images) + [(len(data), len(data))]:
+        gap = data[pos:max(pos, lo)]
+        if gap.count(0xFF) != len(gap):
+            first = pos + next(n for n, b in enumerate(gap) if b != 0xFF)
+            raise RegistryError(f'data at {hex32(base + first)} is outside bootloader/partitions/otadata/firmware '
+                                'and would not be written; upload the separate files instead')
+        pos = max(pos, hi)
+
+
 def build_esp(proj: dict, chip: dict, vdir: Path, rel: dict) -> dict:
     baud = str(rel.get('baud', 'auto'))
     if baud not in ESP_BAUDS:
         raise RegistryError(f'{vdir}/release.toml: baud must be one of {", ".join(ESP_BAUDS)}')
+    merged_path = vdir / ESP_MERGED
+    merged = merged_path.read_bytes() if merged_path.is_file() else None
     data = {}
-    for name, _ in esp_slots(chip):
-        path = vdir / name
-        if not path.is_file():
-            raise RegistryError(f'{path}: not found (ESP releases need bootloader.bin, partitions.bin, firmware.bin)')
-        data[name] = path.read_bytes()
+    if merged is not None:
+        if any((vdir / name).is_file() for name, _ in esp_slots(chip)):
+            raise RegistryError(f'{vdir}: put either {ESP_MERGED} or the three slot files, not both')
+        try:
+            base, data = split_esp_merged(merged, chip)
+        except RegistryError as e:
+            raise RegistryError(f'{merged_path}: {e}') from None
+        where = lambda name: f'{merged_path} ({name})'  # noqa: E731
+    else:
+        for name, _ in esp_slots(chip):
+            path = vdir / name
+            if not path.is_file():
+                raise RegistryError(f'{path}: not found (ESP releases need bootloader.bin, partitions.bin, '
+                                    f'firmware.bin or one {ESP_MERGED})')
+            data[name] = path.read_bytes()
+        where = lambda name: f'{vdir}/{name}'  # noqa: E731
     boot, parts, app = data['bootloader.bin'], data['partitions.bin'], data['firmware.bin']
     try:
         flash_size = inspect_esp_image(boot, chip['chip_id'])
     except RegistryError as e:
-        raise RegistryError(f'{vdir}/bootloader.bin: {e}') from None
+        raise RegistryError(f'{where("bootloader.bin")}: {e}') from None
     try:
         if inspect_esp_image(app, chip['chip_id']) != flash_size:
             raise RegistryError('Flash size setting differs from bootloader.bin')
     except RegistryError as e:
-        raise RegistryError(f'{vdir}/firmware.bin: {e}') from None
+        raise RegistryError(f'{where("firmware.bin")}: {e}') from None
     if chip['boot_address'] + len(boot) > 0x8000:
-        raise RegistryError(f'{vdir}/bootloader.bin: runs past 0x8000')
+        raise RegistryError(f'{where("bootloader.bin")}: runs past 0x8000')
     if len(parts) > 4096:
-        raise RegistryError(f'{vdir}/partitions.bin: larger than 4 KiB')
+        raise RegistryError(f'{where("partitions.bin")}: larger than 4 KiB')
     try:
         ota = inspect_esp_partitions(parts, flash_size, len(app))
     except RegistryError as e:
-        raise RegistryError(f'{vdir}/partitions.bin: {e}') from None
+        raise RegistryError(f'{where("partitions.bin")}: {e}') from None
 
     images = [(name, address, data[name]) for name, address in esp_slots(chip)]
     if ota:
@@ -277,6 +341,11 @@ def build_esp(proj: dict, chip: dict, vdir: Path, rel: dict) -> dict:
         if address < previous_end:
             raise RegistryError(f'{vdir}: {name} overlaps the previous image erase range')
         previous_end = address + ((len(image) + ESP_SECTOR - 1) & ~(ESP_SECTOR - 1))
+    if merged is not None:
+        try:
+            check_merged_rest(merged, base, images)
+        except RegistryError as e:
+            raise RegistryError(f'{merged_path}: {e}') from None
     lines = [f'name={proj["name"]}', f'device={chip["device"]}', f'baud={baud}', f'flash_size={hex32(flash_size)}']
     lines += [f'image={name},{hex32(address)},{hex32(len(image))},{hex32(crc32(image))}' for name, address, image in images]
     fw_txt = ('\n'.join(lines) + '\n').encode('ascii')
@@ -287,7 +356,7 @@ def build_esp(proj: dict, chip: dict, vdir: Path, rel: dict) -> dict:
         'fw_txt': fw_txt,
         'erase': {'unit': ESP_SECTOR, 'count': sum(math.ceil(len(i[2]) / ESP_SECTOR) for i in images)},
         'embedded': esp_app_desc(app),
-        'extra': {'flash_size': flash_size, 'baud': baud, 'ota_reset': ota is not None},
+        'extra': {'flash_size': flash_size, 'baud': baud, 'ota_reset': ota is not None, 'merged': merged is not None},
     }
 
 
@@ -474,6 +543,27 @@ def build(reg: Path, generated: str) -> tuple[dict, dict[str, bytes], list[str]]
     return manifest, out_files, errors
 
 
+ASSET_RE = re.compile(r'(?P<attr>src|href)="(?P<path>[A-Za-z0-9_-]+\.(?:js|css))"')
+
+
+def stamp_assets(out: Path) -> str:
+    """Version local script/style URLs in index.html and return the site build id.
+
+    GitHub Pages serves everything with max-age=600, so browsers keep old app.js/style.css
+    for up to 10 minutes. A content hash in the URL makes a plain reload fetch the new build.
+    """
+    index = out / 'index.html'
+    html = index.read_bytes().decode('utf-8')
+    digest = hashlib.sha256(html.encode('utf-8'))
+    for name in sorted({m['path'] for m in ASSET_RE.finditer(html)}):
+        digest.update((out / name).read_bytes())
+    build = digest.hexdigest()[:12]
+    html = ASSET_RE.sub(lambda m: f'{m["attr"]}="{m["path"]}?v={build}"', html)
+    html = html.replace('</head>', f'  <meta name="hub-build" content="{build}">\n</head>', 1)
+    index.write_bytes(html.encode('utf-8'))
+    return build
+
+
 def write_site(out: Path, web: Path, manifest: dict, files: dict[str, bytes]) -> None:
     if out.exists():
         if any(out.iterdir()) and not (out / 'manifest.json').is_file():
@@ -481,6 +571,8 @@ def write_site(out: Path, web: Path, manifest: dict, files: dict[str, bytes]) ->
         shutil.rmtree(out)
     shutil.copytree(web, out)
     (out / '.nojekyll').write_bytes(b'')
+    # build: site code version, so an open page can tell that the site itself changed
+    manifest = {**manifest, 'build': stamp_assets(out)}
     (out / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     for rel, data in files.items():
         dest = out / rel
