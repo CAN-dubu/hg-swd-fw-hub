@@ -36,6 +36,8 @@ ESP_SECTOR = 0x1000
 ESP_APP_DESC_MAGIC = 0xABCD5432
 ESP_MERGED = 'merged.bin'                          # one flash image instead of the three slot files
 ESP_PART_TABLE = 0xC00                             # partition table size written by ESP-IDF
+NOTICE = 'NOTICE.txt'                              # third-party notices shipped with each package
+LICENSE_REF_RE = re.compile(r'licenses/([A-Za-z0-9._-]+\.txt)')
 CHIP_FIELDS = {
     'stm32': ('name', 'device', 'loader', 'flash_base', 'flash_size', 'sector_size', 'ram'),
     'esp': ('name', 'device', 'chip_id', 'boot_address'),
@@ -131,6 +133,36 @@ def check_shared_package(chip: dict, pid: str, sd: dict[str, bytes]) -> None:
     """Without release.txt chip= a shared_device chip's package would be filed under the base chip."""
     if chip.get('shared_device') is True and not sd.get(f'prog/fw/{pid}/release.txt'):
         raise RegistryError(f'{pid}: chip {chip["id"]} has shared_device = true, so its SD package needs release.txt')
+
+
+def load_licenses(reg: Path) -> dict[str, bytes]:
+    """Full license texts that NOTICE.txt files refer to as licenses/<file>."""
+    folder = reg / 'licenses'
+    return {p.name: p.read_bytes() for p in sorted(folder.glob('*.txt'))} if folder.is_dir() else {}
+
+
+def load_notice(pdir: Path, vdir: Path, licenses: dict[str, bytes]) -> tuple[bytes, list[str]]:
+    """Third-party notices for the binaries; <ver>/NOTICE.txt overrides <id>/NOTICE.txt.
+
+    Returns the text and the license files it names, which go into the SD package with it.
+    """
+    path = vdir / NOTICE if (vdir / NOTICE).is_file() else pdir / NOTICE
+    if not path.is_file():
+        raise RegistryError(f'{pdir}/{NOTICE}: missing; list the third-party software in the firmware and its licenses')
+    data = path.read_bytes()
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
+        raise RegistryError(f'{path}: must be UTF-8') from None
+    if not text.strip():
+        raise RegistryError(f'{path}: empty')
+    if 'TODO' in text:
+        raise RegistryError(f'{path}: fill in or remove the TODO lines')
+    refs = sorted(set(LICENSE_REF_RE.findall(text)))
+    unknown = [r for r in refs if r not in licenses]
+    if unknown:
+        raise RegistryError(f'{path}: unknown license file {", ".join(unknown)}; add it to registry/licenses/')
+    return data, refs
 
 
 def load_loaders(reg: Path) -> dict:
@@ -443,6 +475,7 @@ def make_sd_readme(pid: str, ver: str, name: str, chip: dict, loader: dict | Non
         '- 메뉴 > Storage > SD Delete 는 포맷이 아니라 SD의 모든 파일과 폴더를 지웁니다.',
         '  ST 로더(/prog/loaders/st/0x483.stldr)도 지워지므로, STM32 프로젝트를 쓰려면 로더를 다시 복사해야 합니다.',
         f'- prog/fw/{pid}/release.txt 는 칩과 버전 정보입니다. fw.txt와 함께 두세요.',
+        f'- prog/fw/{pid}/NOTICE.txt 와 prog/licenses/ 는 펌웨어에 포함된 오픈소스의 저작권·라이선스 고지입니다.',
         '',
     ]
     return '\r\n'.join(lines).encode('utf-8')
@@ -461,7 +494,8 @@ def make_zip(files: dict[str, bytes], when: date) -> bytes:
     return buf.getvalue()
 
 
-def build_version(pid: str, proj: dict, chip: dict, loader: dict | None, vdir: Path, out_files: dict) -> dict:
+def build_version(pid: str, proj: dict, chip: dict, loader: dict | None, vdir: Path, out_files: dict,
+                  licenses: dict[str, bytes]) -> dict:
     ver = vdir.name
     rel = load_toml(vdir / 'release.toml', ('date',))
     when = rel['date']
@@ -471,12 +505,16 @@ def build_version(pid: str, proj: dict, chip: dict, loader: dict | None, vdir: P
     images, fw_txt = built['images'], built['fw_txt']
 
     release_txt = make_release_txt(pid, chip['id'], ver, when)
+    notice, notice_licenses = load_notice(vdir.parent, vdir, licenses)
 
     # Extraction order: everything else first, fw.txt last, like prepare_*_sd.py. A half-copied
     # folder has no fw.txt, so the programmer never offers a package that is missing files.
+    # The programmer only reads fw.txt and the images it names, so the notices are ignored on SD.
     sd = {'prog/README.txt': make_sd_readme(pid, ver, proj['name'], chip, loader, images)}
+    sd.update({f'prog/licenses/{name}': licenses[name] for name in notice_licenses})
     if loader is not None and loader['data'] is not None:
         sd[loader['sd_path'].lstrip('/')] = loader['data']
+    sd[f'prog/fw/{pid}/{NOTICE}'] = notice
     sd.update({f'prog/fw/{pid}/{name}': image for name, _, image in images})
     sd[f'prog/fw/{pid}/release.txt'] = release_txt
     sd[f'prog/fw/{pid}/fw.txt'] = fw_txt
@@ -487,6 +525,7 @@ def build_version(pid: str, proj: dict, chip: dict, loader: dict | None, vdir: P
     zip_name = f'{pid}-{ver}-sd.zip'
     for name, _, image in images:
         out_files[f'{base}/{name}'] = image
+    out_files[f'{base}/{NOTICE}'] = notice
     out_files[f'{base}/release.txt'] = release_txt
     out_files[f'{base}/fw.txt'] = fw_txt
     out_files[f'{base}/{zip_name}'] = sd_zip
@@ -506,6 +545,8 @@ def build_version(pid: str, proj: dict, chip: dict, loader: dict | None, vdir: P
                         'sha256': hashlib.sha256(release_txt).hexdigest()},
         'fw_txt': {'url': f'{base}/fw.txt', 'size': len(fw_txt), 'crc32': hex32(crc32(fw_txt)),
                    'sha256': hashlib.sha256(fw_txt).hexdigest()},
+        'notice': {'url': f'{base}/{NOTICE}', 'size': len(notice), 'crc32': hex32(crc32(notice)),
+                   'sha256': hashlib.sha256(notice).hexdigest(), 'licenses': notice_licenses},
         'sd_zip': {'url': f'{base}/{zip_name}', 'size': len(sd_zip),
                    'sha256': hashlib.sha256(sd_zip).hexdigest()},
     }
@@ -545,6 +586,7 @@ def build(reg: Path, generated: str) -> tuple[dict, dict[str, bytes], list[str]]
     try:
         chips = load_chips(reg)
         loaders = load_loaders(reg)
+        licenses = load_licenses(reg)
     except (RegistryError, OSError) as e:
         return {}, {}, [str(e)]
     errors = check_devices(chips)
@@ -575,7 +617,7 @@ def build(reg: Path, generated: str) -> tuple[dict, dict[str, bytes], list[str]]
                 errors.append(f'{vdir}: version folder must be x.y.z or x.y.z-tag')
                 continue
             try:
-                versions.append(build_version(pid, proj, chip, loader, vdir, out_files))
+                versions.append(build_version(pid, proj, chip, loader, vdir, out_files, licenses))
             except (RegistryError, OSError) as e:
                 errors.append(str(e))
         if not versions:
@@ -596,6 +638,8 @@ def build(reg: Path, generated: str) -> tuple[dict, dict[str, bytes], list[str]]
         })
 
     hosted = {ld['id']: f'loaders/{ld["file"]}' for ld in loaders.values() if ld['data'] is not None}
+    for name, text in licenses.items():
+        out_files[f'licenses/{name}'] = text
     for ld in loaders.values():
         if ld['data'] is not None:
             out_files[hosted[ld['id']]] = ld['data']
@@ -606,6 +650,7 @@ def build(reg: Path, generated: str) -> tuple[dict, dict[str, bytes], list[str]]
         'loaders': [{'id': ld['id'], 'name': ld['name'], 'sd_path': ld['sd_path'], 'size': ld['size'],
                      'crc32': hex32(ld['crc32']), 'sha256': ld['sha256'], 'source': ld['source'],
                      'url': hosted.get(ld['id'])} for ld in loaders.values()],
+        'licenses': list(licenses),
         'projects': sorted(projects, key=lambda p: p['id']),
     }
     return manifest, out_files, errors

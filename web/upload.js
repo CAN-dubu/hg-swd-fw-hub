@@ -14,7 +14,7 @@ const ESP_SECTOR = 0x1000;
 const ESP_APP_DESC_MAGIC = 0xABCD5432;
 
 const up = { chip: '', project: '', id: '', name: '', desc: '', image: null, esp: {}, espMode: 'split', merged: null, mergedSplit: null,
-  baud: 'auto', version: '', date: '', notes: '', token: null, busy: false };
+  baud: 'auto', version: '', date: '', notes: '', notice: '', token: null, busy: false };
 
 /* ---------- 계산 ---------- */
 
@@ -422,7 +422,7 @@ const ICONS = {
   folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   file: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
-  gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+  key: '<circle cx="8" cy="15.5" r="4.5"/><path d="M11.2 12.3L20 3.5M16 7.5l2.8 2.8M13.6 9.9l1.8 1.8"/>',
   check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
   alert: '<path d="M12 8v5M12 16.5v.5"/><circle cx="12" cy="12" r="9"/>',
   upload: '<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
@@ -517,19 +517,57 @@ function planUpload() {
   const pkg = chip ? (esp ? planEsp : planStm32)(chip, errors.name || !pname ? null : pname) : empty;
   if (pkg.error) err('image', pkg.error);
   if (pkg.fwTxt && pkg.fwTxt.length > 1024) err('image', 'fw.txt가 1,024바이트를 넘습니다');
+  if (isNew) {
+    // build_registry.load_notice와 같은 검사
+    const unknown = [...up.notice.matchAll(LICENSE_REF_RE)].map((x) => x[1]).filter((f) => !(m.licenses || []).includes(f));
+    if (!up.notice.trim()) err('notice', '펌웨어에 들어간 오픈소스와 라이선스를 적으세요');
+    else if (up.notice.includes('TODO')) err('notice', 'TODO 줄을 채우거나 지우세요');
+    else if (unknown.length) err('notice', `없는 라이선스 파일: ${[...new Set(unknown)].join(', ')}`);
+  }
 
   const dir = `registry/firmware/${pid || '<ID>'}`;
   const vdir = `${dir}/${ver || '<버전>'}`;
   const notes = up.notes.trim();
   const files = [];
   if (isNew) files.push([`${dir}/project.toml`,
-    `name        = ${tomlString(pname)}\nchip        = ${tomlString(chip?.id || '')}\ndescription = ${tomlString(up.desc.trim())}\n`]);
+    `name        = ${tomlString(pname)}\nchip        = ${tomlString(chip?.id || '')}\ndescription = ${tomlString(up.desc.trim())}\n`],
+    [`${dir}/NOTICE.txt`, up.notice.replace(/\r\n?/g, '\n').trimEnd() + '\n']);
   files.push([`${vdir}/release.toml`, `date  = ${up.date}\n` + (esp ? `baud  = "${up.baud}"\n` : '') + (notes ? `notes = ${tomlString(notes, true)}\n` : '')]);
   files.push(...pkg.upload.map(([name, bytes]) => [`${vdir}/${name}`, bytes]));
   return { chip, esp, proj, isNew, pid, pname, ver, errors, pkg, files };
 }
 
 const selectionReady = (p) => !p.errors.chip && !p.errors.project && !p.errors.image;
+
+const LICENSE_REF_RE = /licenses\/([A-Za-z0-9._-]+\.txt)/g;
+
+/* 새 프로젝트의 NOTICE.txt 초안. 확인할 곳은 TODO로 남겨 두고, 남아 있으면 등록할 수 없다 */
+function noticeTemplate(p) {
+  const head = [`${p.pname} (${p.pid}) - third-party software notices`, '',
+    'TODO: copyright line for this firmware, e.g. Copyright (c) 2026 Higenis.',
+    'License texts named licenses/<file> are in prog/licenses/ of the SD package,',
+    'licenses/ on the FW Hub site and registry/licenses/ in the repository.', '', ''];
+  const item = (n, name, copyright, license) => [`${n}. ${name}`, `   ${copyright}`, `   License: ${license}`, ''];
+  const body = p.esp ? [
+    ...item(1, 'Arduino-ESP32 core TODO: core version (Arduino IDE > Boards Manager > esp32)',
+      'Copyright 2015-2026 Espressif Systems (Shanghai) PTE LTD and contributors',
+      'GNU Lesser General Public License v2.1 (licenses/LGPL-2.1.txt)'),
+    ...item(2, `ESP-IDF ${p.pkg.embedded?.idf || 'TODO: version'} (bootloader, drivers and system components)`,
+      'Copyright Espressif Systems (Shanghai) CO LTD', 'Apache License 2.0 (licenses/Apache-2.0.txt)'),
+    ...item(3, 'FreeRTOS Kernel (ESP-IDF port)', 'Copyright (C) 2021 Amazon.com, Inc. or its affiliates.  All Rights Reserved.',
+      'MIT (licenses/MIT.txt)'),
+    ...item(4, 'Mbed TLS', 'Copyright The Mbed TLS Contributors', 'Apache License 2.0 (licenses/Apache-2.0.txt)'),
+    ...item(5, 'newlib C library (Espressif toolchain)', 'Copyright: see the license file', 'various permissive licenses (licenses/newlib.txt)'),
+    'TODO: add each library the sketch uses (name, version, copyright, license), or delete this line.',
+  ] : [
+    'TODO: list each third-party library linked into app.bin (name, version, copyright, license).',
+    'Parts most STM32 builds contain:', '',
+    ...item(1, 'STM32 HAL driver', 'Copyright (c) STMicroelectronics', 'BSD-3-Clause (licenses/BSD-3-Clause.txt)'),
+    ...item(2, 'CMSIS', 'Copyright (c) Arm Limited', 'Apache License 2.0 (licenses/Apache-2.0.txt)'),
+    ...item(3, 'newlib C library (Arm GNU toolchain)', 'Copyright: see the license file', 'various permissive licenses (licenses/newlib.txt)'),
+  ];
+  return [...head, ...body].join('\n').trimEnd() + '\n';
+}
 
 /* 파일 칸: [고른 수, 필요한 수]. ESP 통파일은 1개 */
 function fileProgress(chip) {
@@ -556,7 +594,7 @@ const ESP_MODES = {
 
 function resetUpload(keepToken = true) {
   clearFiles();
-  Object.assign(up, { chip: '', project: '', id: '', name: '', desc: '', baud: 'auto', version: '', notes: '',
+  Object.assign(up, { chip: '', project: '', id: '', name: '', desc: '', baud: 'auto', version: '', notes: '', notice: '',
     date: new Date().toLocaleDateString('sv-SE') });
   if (!keepToken) up.token = loadToken();
 }
@@ -622,7 +660,7 @@ function renderUpload() {
     const ready = selectionReady(p);
     next.disabled = !ready;
     nextHint.textContent = ready ? '' : p.errors.chip || p.errors.project || (fileCount ? p.errors.image : '펌웨어 파일을 고르세요');
-    conn.replaceChildren(icon('gear'), up.token.value ? 'GitHub 연결됨' : 'GitHub 연결');
+    conn.replaceChildren(icon('key'), up.token.value ? 'GitHub 연결됨' : 'GitHub 연결');
     conn.classList.toggle('on', !!up.token.value);
     return p;
   }
@@ -800,6 +838,7 @@ function renderUpload() {
     const p0 = planUpload();
     if (!selectionReady(p0)) return;
     if (!up.version || p0.errors.version) up.version = suggestVersion(p0.proj);
+    if (p0.isNew && !up.notice) up.notice = noticeTemplate(p0);
     const body = h('div', {});
     const submitBtn = h('button', { type: 'button', class: 'btn primary', onclick: () => run() }, '등록 요청 만들기');
     const cancel = h('button', { type: 'button', class: 'btn', onclick: () => modal.close() }, '취소');
@@ -828,7 +867,9 @@ function renderUpload() {
       h('div', { class: 'fields' },
         field('버전', bindInput('version', 'input', { autocomplete: 'off', spellcheck: 'false' }), 'version',
           p.proj ? `지금 게시된 버전은 v${p.proj.latest}입니다` : '처음이면 1.0.0'),
-        field('변경 내용 (선택)', bindInput('notes', 'textarea', { rows: '3', placeholder: '무엇이 바뀌었는지 한두 줄' }), 'notes')),
+        field('변경 내용 (선택)', bindInput('notes', 'textarea', { rows: '3', placeholder: '무엇이 바뀌었는지 한두 줄' }), 'notes'),
+        p.isNew ? field('오픈소스 고지 (NOTICE.txt)', bindInput('notice', 'textarea', { rows: '10', class: 'mono', spellcheck: 'false' }), 'notice',
+          '새 프로젝트에 한 번 적습니다. 펌웨어에 들어간 오픈소스의 저작권과 라이선스를 적고 TODO 줄을 채우세요. SD 패키지에 함께 들어갑니다.') : null),
       h('details', { class: 'more' }, h('summary', {}, '고급 설정'),
         h('div', { class: 'fields' },
           field('날짜', bindInput('date', 'input', { type: 'date' }), 'date'),

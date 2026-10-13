@@ -15,6 +15,9 @@ sys.path.insert(0, str(ROOT / 'tools'))
 import build_registry as br  # noqa: E402
 
 
+NOTICE_TEXT = 'Demo firmware notices\nCMSIS: Apache License 2.0 (licenses/Apache-2.0.txt)\n'
+
+
 def image(size=0x1000, sp=0x24050000, reset=0x08000201, version=None):
     data = bytearray(size)
     struct.pack_into('<II', data, 0, sp, reset)
@@ -29,6 +32,7 @@ class RegistryTest(unittest.TestCase):
         self.reg = self.tmp / 'registry'
         shutil.copytree(ROOT / 'registry' / 'chips', self.reg / 'chips')
         shutil.copytree(ROOT / 'registry' / 'loaders', self.reg / 'loaders')
+        shutil.copytree(ROOT / 'registry' / 'licenses', self.reg / 'licenses')
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
@@ -37,6 +41,7 @@ class RegistryTest(unittest.TestCase):
         p = self.reg / 'firmware' / pid
         (p / ver).mkdir(parents=True, exist_ok=True)
         (p / 'project.toml').write_text(f'name = "{name}"\nchip = "{chip}"\ndescription = "데모"\n', 'utf-8')
+        (p / 'NOTICE.txt').write_bytes(NOTICE_TEXT.encode())
         (p / ver / 'release.toml').write_text(f'date = {date}\nnotes = "first"\n', 'utf-8')
         (p / ver / 'app.bin').write_bytes(image() if data is None else data)
 
@@ -62,11 +67,49 @@ class RegistryTest(unittest.TestCase):
         _, files, _ = self.build()
         z = zipfile.ZipFile(io.BytesIO(files['fw/h723-gfx/1.0.0/h723-gfx-1.0.0-sd.zip']))
         # Extraction order: release.txt after the images, fw.txt last.
-        self.assertEqual(z.namelist(), ['prog/README.txt', 'prog/fw/h723-gfx/app.bin',
-                                        'prog/fw/h723-gfx/release.txt', 'prog/fw/h723-gfx/fw.txt'])
+        self.assertEqual(z.namelist(), ['prog/README.txt', 'prog/licenses/Apache-2.0.txt', 'prog/fw/h723-gfx/NOTICE.txt',
+                                        'prog/fw/h723-gfx/app.bin', 'prog/fw/h723-gfx/release.txt',
+                                        'prog/fw/h723-gfx/fw.txt'])
         readme = z.read('prog/README.txt').decode('utf-8')
-        for needle in ('0x483.stldr', 'Manual > Flash', 'Storage > Installed bin', 'SD Delete', '최대 16개', '16+'):
+        for needle in ('0x483.stldr', 'Manual > Flash', 'Storage > Installed bin', 'SD Delete', '최대 16개', '16+',
+                       'NOTICE.txt'):
             self.assertIn(needle, readme)
+
+    def test_notice_is_packaged_with_the_licenses_it_names(self):
+        self.add()
+        manifest, files, errors = self.build()
+        self.assertEqual(errors, [])
+        z = zipfile.ZipFile(io.BytesIO(files['fw/h723-gfx/1.0.0/h723-gfx-1.0.0-sd.zip']))
+        self.assertEqual(z.read('prog/fw/h723-gfx/NOTICE.txt'), NOTICE_TEXT.encode())
+        self.assertEqual(z.read('prog/licenses/Apache-2.0.txt'),
+                         (ROOT / 'registry' / 'licenses' / 'Apache-2.0.txt').read_bytes())
+        self.assertNotIn('prog/licenses/LGPL-2.1.txt', z.namelist())  # only what the notice names
+        self.assertEqual(files['fw/h723-gfx/1.0.0/NOTICE.txt'], NOTICE_TEXT.encode())
+        self.assertEqual(manifest['projects'][0]['versions'][0]['notice']['licenses'], ['Apache-2.0.txt'])
+        self.assertIn('licenses/LGPL-2.1.txt', files)  # the site hosts every license text
+        self.assertIn('LGPL-2.1.txt', manifest['licenses'])
+        # A version folder may carry its own notice, e.g. after a library update.
+        (self.reg / 'firmware' / 'h723-gfx' / '1.0.0' / 'NOTICE.txt').write_bytes(b'New\nlicenses/LGPL-2.1.txt\n')
+        _, files, errors = self.build()
+        self.assertEqual(errors, [])
+        z = zipfile.ZipFile(io.BytesIO(files['fw/h723-gfx/1.0.0/h723-gfx-1.0.0-sd.zip']))
+        self.assertEqual(z.read('prog/fw/h723-gfx/NOTICE.txt'), b'New\nlicenses/LGPL-2.1.txt\n')
+        self.assertIn('prog/licenses/LGPL-2.1.txt', z.namelist())
+
+    def test_notice_rejections(self):
+        cases = {'missing': None, 'todo': 'TODO: list the libraries\n', 'badref': 'X (licenses/GPL-9.txt)\n', 'blank': ' \n'}
+        for pid, text in cases.items():
+            self.add(pid=pid)
+            notice = self.reg / 'firmware' / pid / 'NOTICE.txt'
+            if text is None:
+                notice.unlink()
+            else:
+                notice.write_text(text, 'utf-8')
+        manifest, _, errors = self.build()
+        self.assertEqual(manifest['projects'], [])
+        text = '\n'.join(errors)
+        for needle in ('missing/NOTICE.txt: missing', 'TODO lines', 'unknown license file GPL-9.txt', 'NOTICE.txt: empty'):
+            self.assertIn(needle, text)
 
     def test_release_txt(self):
         self.add(ver='1.2.0-rc.1', date='2026-10-13')
@@ -241,6 +284,7 @@ class EspRegistryTest(unittest.TestCase):
         p = self.reg / 'firmware' / pid
         (p / '1.0.0').mkdir(parents=True, exist_ok=True)
         (p / 'project.toml').write_text(f'name = "HG-ESP32-S3-RLY4-PRO"\nchip = "{chip}"\n', 'utf-8')
+        (p / 'NOTICE.txt').write_bytes(NOTICE_TEXT.encode())
         (p / '1.0.0' / 'release.toml').write_text(f'date = 2026-10-07\n{release}', 'utf-8')
         for name, data in (('bootloader.bin', boot or esp_image()), ('partitions.bin', parts or partition_table()),
                            ('firmware.bin', app or esp_image(payload=b'\x22' * 3000))):
@@ -261,7 +305,8 @@ class EspRegistryTest(unittest.TestCase):
                          f'image=ota-reset.bin,0x0000E000,0x00002000,{crc(ota)}\n'
                          f'image=firmware.bin,0x00010000,0x{len(app):08X},{crc(app)}\n')
         z = zipfile.ZipFile(io.BytesIO(files['fw/rly4/1.0.0/rly4-1.0.0-sd.zip']))
-        self.assertEqual(z.namelist(), ['prog/README.txt', 'prog/fw/rly4/bootloader.bin', 'prog/fw/rly4/partitions.bin',
+        self.assertEqual(z.namelist(), ['prog/README.txt', 'prog/licenses/Apache-2.0.txt', 'prog/fw/rly4/NOTICE.txt',
+                                        'prog/fw/rly4/bootloader.bin', 'prog/fw/rly4/partitions.bin',
                                         'prog/fw/rly4/ota-reset.bin', 'prog/fw/rly4/firmware.bin',
                                         'prog/fw/rly4/release.txt', 'prog/fw/rly4/fw.txt'])
         self.assertEqual(z.read('prog/fw/rly4/release.txt'),
@@ -288,6 +333,7 @@ class EspRegistryTest(unittest.TestCase):
         p = self.reg / 'firmware' / pid
         (p / '1.0.0').mkdir(parents=True, exist_ok=True)
         (p / 'project.toml').write_text(f'name = "HG-ESP32-S3-RLY4-PRO"\nchip = "{chip}"\n', 'utf-8')
+        (p / 'NOTICE.txt').write_bytes(NOTICE_TEXT.encode())
         (p / '1.0.0' / 'release.toml').write_text('date = 2026-10-07\n', 'utf-8')
         (p / '1.0.0' / 'merged.bin').write_bytes(data)
 

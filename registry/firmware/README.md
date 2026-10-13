@@ -8,11 +8,13 @@
 registry/firmware/
 ├── h723/                     프로젝트 ID = SD의 /prog/fw/<ID>/ 폴더명
 │   ├── project.toml
+│   ├── NOTICE.txt            오픈소스 고지 (필수)
 │   └── 1.0.0/                버전 (x.y.z 또는 x.y.z-rc.1)
 │       ├── release.toml
 │       └── app.bin           STM32: 이미지 하나
 └── esp32s3-rly4-pro/
     ├── project.toml
+    ├── NOTICE.txt
     └── 1.0.0/
         ├── release.toml
         ├── bootloader.bin    ESP: 이름이 정해진 세 파일
@@ -54,4 +56,5 @@ notes = """
 - 이미지 `0x400`에 `VER ` 헤더가 있으면 내장 버전과 이름을 읽어 사이트에 표시합니다.
 - 이미 게시한 버전 폴더는 고치지 말고 새 버전을 추가합니다. 기기는 버전 문자열로 변경 여부를 판단합니다. 단, SD zip과 그 안의 `README.txt`, `release.txt`는 CI가 매번 다시 만들므로 패키지 형식이 바뀌면 예전 버전 것도 함께 바뀝니다. 이미지와 `fw.txt`는 바뀌지 않습니다.
 - `release.txt`(칩·버전)는 CI가 만듭니다. 버전 폴더에 직접 넣지 않습니다.
+- `NOTICE.txt`에는 펌웨어에 들어간 오픈소스의 이름, 버전, 저작권 줄, 라이선스를 적습니다. 라이선스 전문은 `licenses/<name>.txt`로 가리키고, 파일은 `registry/licenses/`에 둡니다. `TODO`가 남아 있으면 CI가 막습니다. 버전마다 라이브러리가 다르면 버전 폴더에 `NOTICE.txt`를 따로 둡니다. 예시는 기존 프로젝트의 `NOTICE.txt`를 참고합니다.
 - 올리기 전에 로컬에서 `python tools/build_registry.py --check`로 검사할 수 있습니다.

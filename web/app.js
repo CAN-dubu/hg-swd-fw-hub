@@ -330,7 +330,8 @@ function renderProject(id, ver) {
   const kv = (label, value, { title, wide } = {}) =>
     h('div', { class: wide ? 'kv wide' : 'kv' }, h('dt', {}, label), h('dd', { title }, value));
   // 기기에 기록하는 BIN이 먼저, 패키지 설명 파일(release.txt, fw.txt)은 아래에 옅게
-  const texts = [v.release_txt && { name: 'release.txt', ...v.release_txt }, { name: 'fw.txt', ...v.fw_txt }].filter(Boolean);
+  const texts = [v.notice && { name: 'NOTICE.txt', ...v.notice }, v.release_txt && { name: 'release.txt', ...v.release_txt },
+    { name: 'fw.txt', ...v.fw_txt }].filter(Boolean);
   const fileRow = (f, side) => h('tr', { class: side ? 'side' : null },
     h('td', {}, h('a', { href: f.url, download: '' }, f.name)),
     h('td', {}, f.address ? h('code', {}, f.address) : h('span', { class: 'muted' }, '—')),

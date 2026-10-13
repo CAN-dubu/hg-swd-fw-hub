@@ -230,6 +230,7 @@ button.btn { font: inherit; font-size: 0.86rem; cursor: pointer; }
   border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); font: inherit;
 }
 .field textarea { height: auto; padding: 8px 10px; resize: vertical; line-height: 1.5; }
+.field textarea.mono { font: .76rem/1.5 var(--mono); white-space: pre; }
 .field input:focus, .field select:focus, .field textarea:focus, .token-row input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .field.invalid input { border-color: var(--err); }
 .hint { font-size: 0.8rem; color: var(--muted); }

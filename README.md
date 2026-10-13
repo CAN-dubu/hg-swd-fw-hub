@@ -17,8 +17,10 @@ registry/
 │                              또는 "esp"(device, 이미지 칩 ID, 부트로더 주소)
 │                              device가 같은 칩끼리는 shared_device 규칙 (아래 검사 항목)
 ├── loaders/<loader>.toml      STM32 Flash 로더 지문(크기, CRC32, SHA-256). 파일은 배포하지 않음
+├── licenses/<name>.txt        NOTICE.txt가 licenses/<name>.txt로 가리키는 라이선스 전문
 └── firmware/<id>/             프로젝트 = SD의 /prog/fw/<id>/
     ├── project.toml
+    ├── NOTICE.txt             펌웨어에 들어간 오픈소스의 저작권·라이선스 고지 (필수)
     └── <version>/
         ├── release.toml
         ├── app.bin                                      STM32
@@ -48,6 +50,8 @@ web/                           정적 UI (manifest.json 렌더링, upload.js = �
 | `fw/<id>/<ver>/<image>` | 이미지. STM32는 `app.bin`, ESP는 `bootloader.bin`, `partitions.bin`, `firmware.bin`과 생성된 `ota-reset.bin` |
 | `fw/<id>/<ver>/fw.txt` | 프로그래머가 읽는 매니페스트. HG-SWD-PROG의 `prepare_h723_sd.py` / `prepare_esp_sd.py` 출력과 바이트 단위로 같음 |
 | `fw/<id>/<ver>/release.txt` | 칩·버전 정보. 기기가 `fw.txt`만으로는 알 수 없는 값 |
+| `fw/<id>/<ver>/NOTICE.txt` | 펌웨어에 들어간 오픈소스 고지. SD 패키지에는 `prog/fw/<id>/NOTICE.txt`로 들어감 |
+| `licenses/<name>.txt` | 라이선스 전문. SD 패키지에는 그 프로젝트의 NOTICE.txt가 가리키는 것만 `prog/licenses/`로 들어감 |
 | `fw/<id>/<ver>/<id>-<ver>-sd.zip` | `prog/` 폴더째 SD 루트에 푸는 패키지 |
 
 `latest.txt` 예(ESP):
@@ -141,6 +145,18 @@ python -m http.server -d _site 8000             # http://localhost:8000
 - **Settings → Pages → Build and deployment → Source**를 **GitHub Actions**로 바꿉니다.
 - 권장: **Settings → General → Automatically delete head branches**를 켜서, 머지한 `fw/*` 브랜치가 자동으로 지워지게 합니다.
 - 웹 등록은 main 브랜치가 있어야 동작합니다. 첫 커밋을 먼저 푸시하세요.
+
+## 라이선스
+
+이 저장소의 코드는 [MIT License](LICENSE)입니다. `registry/firmware/`의 펌웨어 바이너리는 여기에 포함되지 않고, 각 프로젝트의 `NOTICE.txt`를 따릅니다. 사이트가 쓰는 외부 리소스와 펌웨어별 구성 요소는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)에 모아 두었습니다.
+
+펌웨어를 공개 배포하므로 프로젝트마다 `NOTICE.txt`가 있어야 합니다. CI가 검사하는 항목은 다음과 같습니다.
+
+- 파일이 있어야 하고 UTF-8이며 비어 있지 않아야 합니다. `<ver>/NOTICE.txt`가 있으면 그 버전에는 그것을 씁니다(라이브러리가 바뀐 버전).
+- `TODO`가 남아 있으면 안 됩니다. 등록 페이지가 새 프로젝트에 넣는 초안은 확인할 곳을 `TODO`로 남겨 둡니다.
+- `licenses/<name>.txt`로 가리킨 파일은 `registry/licenses/`에 있어야 합니다. SD 패키지에는 가리킨 파일만 들어갑니다.
+
+`NOTICE.txt`에 무엇을 적을지는 빌드한 사람이 확인해야 합니다. 링크된 라이브러리는 빌드의 `.map` 파일에서, Arduino-ESP32 코어 버전은 Boards Manager에서 확인합니다. Arduino-ESP32 코어는 LGPL-2.1이므로, 고지 외에 라이브러리 소스와 다시 링크할 수 있는 자료를 받을 수 있게 하는 의무도 따릅니다.
 
 ## 로더 라이선스
 
