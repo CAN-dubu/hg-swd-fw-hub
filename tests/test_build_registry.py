@@ -33,10 +33,10 @@ class RegistryTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
-    def add(self, pid='h723-gfx', ver='1.0.0', data=None, name='H723 GFX firmware', date='2026-10-12'):
+    def add(self, pid='h723-gfx', ver='1.0.0', data=None, name='H723 GFX firmware', date='2026-10-12', chip='stm32h723'):
         p = self.reg / 'firmware' / pid
         (p / ver).mkdir(parents=True, exist_ok=True)
-        (p / 'project.toml').write_text(f'name = "{name}"\nchip = "stm32h723"\ndescription = "데모"\n', 'utf-8')
+        (p / 'project.toml').write_text(f'name = "{name}"\nchip = "{chip}"\ndescription = "데모"\n', 'utf-8')
         (p / ver / 'release.toml').write_text(f'date = {date}\nnotes = "first"\n', 'utf-8')
         (p / ver / 'app.bin').write_bytes(image() if data is None else data)
 
@@ -61,9 +61,67 @@ class RegistryTest(unittest.TestCase):
         self.add()
         _, files, _ = self.build()
         z = zipfile.ZipFile(io.BytesIO(files['fw/h723-gfx/1.0.0/h723-gfx-1.0.0-sd.zip']))
-        self.assertEqual(sorted(z.namelist()),
-                         ['prog/README.txt', 'prog/fw/h723-gfx/app.bin', 'prog/fw/h723-gfx/fw.txt'])
-        self.assertIn('0x483.stldr', z.read('prog/README.txt').decode('utf-8'))
+        # Extraction order: release.txt after the images, fw.txt last.
+        self.assertEqual(z.namelist(), ['prog/README.txt', 'prog/fw/h723-gfx/app.bin',
+                                        'prog/fw/h723-gfx/release.txt', 'prog/fw/h723-gfx/fw.txt'])
+        readme = z.read('prog/README.txt').decode('utf-8')
+        for needle in ('0x483.stldr', 'Manual > Flash', 'Storage > Installed bin', 'SD Delete', '최대 16개', '16+'):
+            self.assertIn(needle, readme)
+
+    def test_release_txt(self):
+        self.add(ver='1.2.0-rc.1', date='2026-10-13')
+        _, files, errors = self.build()
+        self.assertEqual(errors, [])
+        expected = b'schema=1\nid=h723-gfx\nchip=stm32h723\nversion=1.2.0-rc.1\ndate=2026-10-13\n'
+        self.assertEqual(files['fw/h723-gfx/1.2.0-rc.1/release.txt'], expected)
+        z = zipfile.ZipFile(io.BytesIO(files['fw/h723-gfx/1.2.0-rc.1/h723-gfx-1.2.0-rc.1-sd.zip']))
+        self.assertEqual(z.read('prog/fw/h723-gfx/release.txt'), expected)
+
+    def set_chip(self, chip, shared=None, device=None):
+        """Write chips/<chip>.toml as a copy of stm32h723, optionally flagged or with another device."""
+        text = (ROOT / 'registry' / 'chips' / 'stm32h723.toml').read_text('utf-8')
+        if device is not None:
+            text = text.replace('"STM32H72x/STM32H73x"', f'"{device}"')
+        if shared is not None:
+            text += f'shared_device = {str(shared).lower()}\n'
+        (self.reg / 'chips' / f'{chip}.toml').write_text(text, 'utf-8')
+
+    def test_shared_device_needs_exactly_one_base_chip(self):
+        group = 'chips stm32h723, stm32h733 share device "STM32H72x/STM32H73x"'
+        self.add()
+        self.set_chip('stm32h733')  # two chips without the flag: device= cannot tell them apart
+        _, _, errors = self.build()
+        self.assertTrue(any(group in e and 'found 2' in e for e in errors), errors)
+
+        self.set_chip('stm32h723', shared=True)  # every chip flagged: no chip for packages without release.txt
+        self.set_chip('stm32h733', shared=True)
+        _, _, errors = self.build()
+        self.assertTrue(any(group in e and 'found 0' in e for e in errors), errors)
+
+        self.set_chip('stm32h723')  # the original chip stays the base, the later one opts in
+        self.add(pid='h733-gfx', chip='stm32h733')
+        _, files, errors = self.build()
+        self.assertEqual(errors, [])
+        self.assertIn(b'chip=stm32h733\n', files['fw/h733-gfx/1.0.0/release.txt'])
+
+        self.set_chip('stm32h7a3', shared=True, device='STM32H7Ax')  # a flag with nothing to share
+        _, _, errors = self.build()
+        self.assertTrue(any('chip stm32h7a3: shared_device = true but no other chip' in e for e in errors), errors)
+
+        self.set_chip('stm32h7a3', device='STM32H7Ax')
+        (self.reg / 'chips' / 'stm32h7a3.toml').write_text(
+            (self.reg / 'chips' / 'stm32h7a3.toml').read_text('utf-8') + 'shared_device = "yes"\n', 'utf-8')
+        _, _, errors = self.build()
+        self.assertTrue(any('stm32h7a3: shared_device must be true or false' in e for e in errors), errors)
+
+    def test_shared_device_package_needs_release_txt(self):
+        shared = {'id': 'stm32h733', 'shared_device': True}
+        base = {'id': 'stm32h723'}
+        sd = {'prog/fw/x/app.bin': b'1', 'prog/fw/x/fw.txt': b'2'}
+        with self.assertRaisesRegex(br.RegistryError, 'shared_device = true, so its SD package needs release.txt'):
+            br.check_shared_package(shared, 'x', sd)
+        br.check_shared_package(base, 'x', sd)  # the base chip is found by device= alone
+        br.check_shared_package(shared, 'x', {**sd, 'prog/fw/x/release.txt': b'schema=1\n'})
 
     def test_latest_skips_prerelease(self):
         self.add(ver='1.0.0')
@@ -76,7 +134,11 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(project['latest'], '1.1.0')
         latest = files['fw/h723-gfx/latest.txt'].decode('ascii')
         self.assertIn('version=1.1.0\ndate=2026-10-12\nbase=fw/h723-gfx/1.1.0/\nfile=app.bin,4096,', latest)
-        self.assertTrue(latest.splitlines()[-1].startswith('file=fw.txt,'))
+        self.assertEqual([line.split(',')[0] for line in latest.splitlines() if line.startswith('file=')],
+                         ['file=app.bin', 'file=release.txt', 'file=fw.txt'])
+        release = files['fw/h723-gfx/1.1.0/release.txt']
+        self.assertIn(f'file=release.txt,{len(release)},0x{zlib.crc32(release):08X},'
+                      f'{hashlib.sha256(release).hexdigest()}\n', latest)
 
     def test_embedded_version_is_reported(self):
         self.add(data=image(version='1.0.0'))
@@ -199,12 +261,16 @@ class EspRegistryTest(unittest.TestCase):
                          f'image=ota-reset.bin,0x0000E000,0x00002000,{crc(ota)}\n'
                          f'image=firmware.bin,0x00010000,0x{len(app):08X},{crc(app)}\n')
         z = zipfile.ZipFile(io.BytesIO(files['fw/rly4/1.0.0/rly4-1.0.0-sd.zip']))
-        self.assertEqual(z.namelist()[-2:], ['prog/fw/rly4/fw.txt', 'prog/README.txt'])
+        self.assertEqual(z.namelist(), ['prog/README.txt', 'prog/fw/rly4/bootloader.bin', 'prog/fw/rly4/partitions.bin',
+                                        'prog/fw/rly4/ota-reset.bin', 'prog/fw/rly4/firmware.bin',
+                                        'prog/fw/rly4/release.txt', 'prog/fw/rly4/fw.txt'])
+        self.assertEqual(z.read('prog/fw/rly4/release.txt'),
+                         b'schema=1\nid=rly4\nchip=esp32s3\nversion=1.0.0\ndate=2026-10-07\n')
         self.assertEqual(z.read('prog/fw/rly4/ota-reset.bin'), ota)
         latest = files['fw/rly4/latest.txt'].decode('ascii').splitlines()
         self.assertEqual([line.split(',')[0] for line in latest if line.startswith('file=')],
                          ['file=bootloader.bin', 'file=partitions.bin', 'file=ota-reset.bin', 'file=firmware.bin',
-                          'file=fw.txt'])
+                          'file=release.txt', 'file=fw.txt'])
         v = manifest['projects'][0]['versions'][0]
         self.assertEqual((v['baud'], v['flash_size'], v['erase']['unit']), ('auto', '0x01000000', 4096))
 

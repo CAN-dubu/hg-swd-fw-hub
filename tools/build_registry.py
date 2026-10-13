@@ -99,6 +99,40 @@ def load_chips(reg: Path) -> dict:
     return chips
 
 
+def check_devices(chips: dict) -> list[str]:
+    """Programmers file a package under the chip whose device matches fw.txt device= (exact strcmp).
+
+    shared_device = true marks a chip added later that reuses an existing chip's device string.
+    Such a chip is recognised only through release.txt chip=; a package without release.txt is
+    filed under the one chip of its device group that lacks the flag. So every group needs
+    exactly one chip without it.
+    """
+    errors = []
+    groups: dict[str, list[dict]] = {}
+    for c in chips.values():
+        if not isinstance(c.get('shared_device', False), bool):
+            errors.append(f'chip {c["id"]}: shared_device must be true or false')
+        groups.setdefault(str(c['device']).strip(), []).append(c)
+    for device, same in groups.items():
+        base = [c['id'] for c in same if c.get('shared_device') is not True]
+        if len(base) == 1:
+            continue
+        ids = ', '.join(c['id'] for c in same)
+        if len(same) == 1:
+            errors.append(f'chip {ids}: shared_device = true but no other chip has device "{device}"; '
+                          'remove the flag')
+        else:
+            errors.append(f'chips {ids} share device "{device}": exactly one of them must lack shared_device = true '
+                          f'(found {len(base)}), since programmers file packages without release.txt under it')
+    return errors
+
+
+def check_shared_package(chip: dict, pid: str, sd: dict[str, bytes]) -> None:
+    """Without release.txt chip= a shared_device chip's package would be filed under the base chip."""
+    if chip.get('shared_device') is True and not sd.get(f'prog/fw/{pid}/release.txt'):
+        raise RegistryError(f'{pid}: chip {chip["id"]} has shared_device = true, so its SD package needs release.txt')
+
+
 def load_loaders(reg: Path) -> dict:
     loaders = {}
     for p in sorted((reg / 'loaders').glob('*.toml')):
@@ -150,8 +184,8 @@ def make_stm32_fw_txt(name: str, chip: dict, loader: dict, image_name: str, imag
 
 def build_stm32(proj: dict, chip: dict, loader: dict, vdir: Path, rel: dict) -> dict:
     image_name = rel.get('image', 'app.bin')
-    if not FILE_RE.fullmatch(image_name) or '..' in image_name:
-        raise RegistryError(f'{vdir}: image must be a plain file name up to 47 chars')
+    if not FILE_RE.fullmatch(image_name) or '..' in image_name or image_name.lower() in ('fw.txt', 'release.txt'):
+        raise RegistryError(f'{vdir}: image must be a plain file name up to 47 chars, not fw.txt or release.txt')
     path = vdir / image_name
     if not path.is_file():
         raise RegistryError(f'{path}: not found')
@@ -362,18 +396,31 @@ def build_esp(proj: dict, chip: dict, vdir: Path, rel: dict) -> dict:
 
 # ---------- packaging ----------
 
+def make_release_txt(pid: str, chip_id: str, ver: str, when: date) -> bytes:
+    """Chip and version for the programmer, which can't learn them from fw.txt.
+
+    A separate file because the fw.txt parsers reject unknown keys; older programmers ignore it.
+    Same key=value style as latest.txt.
+    """
+    return (f'schema={SCHEMA}\n'
+            f'id={pid}\n'
+            f'chip={chip_id}\n'
+            f'version={ver}\n'
+            f'date={when.isoformat()}\n').encode('ascii')
+
+
 def make_sd_readme(pid: str, ver: str, name: str, chip: dict, loader: dict | None, images: list) -> bytes:
     lines = [
         'HG-SWD-PROG SD 패키지',
         '',
         f'프로젝트 : {name} ({pid})',
         f'버전     : {ver}',
-        f'대상 칩  : {chip["name"]}',
+        f'대상 칩  : {chip["name"]} ({chip["id"]})',
     ]
     for image_name, address, image in images:
         lines += [f'{image_name:<15}: {hex32(address)}, {len(image)} bytes, CRC32 {hex32(crc32(image))}',
                   f'{"":<15}  SHA-256 {hashlib.sha256(image).hexdigest()}']
-    lines += ['', '1. 이 zip의 prog 폴더를 FAT32 SD카드 루트에 풉니다.']
+    lines += ['', '1. 이 zip의 prog 폴더를 FAT32 SD카드 루트에 풉니다. 같은 프로젝트의 이전 버전은 덮어씁니다.']
     if loader is None:
         lines.append('2. ESP는 로더 파일이 필요 없습니다. RAM stub이 프로그래머 펌웨어에 들어 있습니다.')
     elif loader['data'] is None:
@@ -385,8 +432,19 @@ def make_sd_readme(pid: str, ver: str, name: str, chip: dict, loader: dict | Non
         ]
     else:
         lines.append('2. 로더가 패키지에 포함되어 있습니다.')
-    lines += [f'3. 프로그래머 메뉴 > Flash 에서 {pid} 를 선택하거나, Auto setup 에서 {chip["name"]} 프로젝트로 지정합니다.',
-              f'   SD 파일만 점검하려면 CLI에서 prog check {pid}', '']
+    lines += [
+        f'3. 프로그래머 메뉴(M) > Manual > Flash 에서 {pid} 를 고르거나, Auto setup 에서 {chip["name"]} 프로젝트로 지정합니다.',
+        '   카드에 있는 패키지는 메뉴 > Storage > Installed bin 에서 칩별로 확인합니다.',
+        f'   SD 파일만 점검하려면 CLI에서 prog check {pid}',
+        '',
+        '주의',
+        '- SD에는 칩 구분 없이 최대 16개까지 둘 수 있습니다. 넘으면 프로젝트 ID 알파벳순으로 앞의 16개만 표시되고,',
+        '  Installed bin에 16+가 표시됩니다.',
+        '- 메뉴 > Storage > SD Delete 는 포맷이 아니라 SD의 모든 파일과 폴더를 지웁니다.',
+        '  ST 로더(/prog/loaders/st/0x483.stldr)도 지워지므로, STM32 프로젝트를 쓰려면 로더를 다시 복사해야 합니다.',
+        f'- prog/fw/{pid}/release.txt 는 칩과 버전 정보입니다. fw.txt와 함께 두세요.',
+        '',
+    ]
     return '\r\n'.join(lines).encode('utf-8')
 
 
@@ -412,17 +470,24 @@ def build_version(pid: str, proj: dict, chip: dict, loader: dict | None, vdir: P
     built = build_esp(proj, chip, vdir, rel) if chip['kind'] == 'esp' else build_stm32(proj, chip, loader, vdir, rel)
     images, fw_txt = built['images'], built['fw_txt']
 
-    sd = {f'prog/fw/{pid}/{name}': image for name, _, image in images}
-    sd[f'prog/fw/{pid}/fw.txt'] = fw_txt  # last, like prepare_*_sd.py: no manifest without its images
-    sd['prog/README.txt'] = make_sd_readme(pid, ver, proj['name'], chip, loader, images)
+    release_txt = make_release_txt(pid, chip['id'], ver, when)
+
+    # Extraction order: everything else first, fw.txt last, like prepare_*_sd.py. A half-copied
+    # folder has no fw.txt, so the programmer never offers a package that is missing files.
+    sd = {'prog/README.txt': make_sd_readme(pid, ver, proj['name'], chip, loader, images)}
     if loader is not None and loader['data'] is not None:
         sd[loader['sd_path'].lstrip('/')] = loader['data']
+    sd.update({f'prog/fw/{pid}/{name}': image for name, _, image in images})
+    sd[f'prog/fw/{pid}/release.txt'] = release_txt
+    sd[f'prog/fw/{pid}/fw.txt'] = fw_txt
+    check_shared_package(chip, pid, sd)
     sd_zip = make_zip(sd, when)
 
     base = f'fw/{pid}/{ver}'
     zip_name = f'{pid}-{ver}-sd.zip'
     for name, _, image in images:
         out_files[f'{base}/{name}'] = image
+    out_files[f'{base}/release.txt'] = release_txt
     out_files[f'{base}/fw.txt'] = fw_txt
     out_files[f'{base}/{zip_name}'] = sd_zip
     return {
@@ -437,6 +502,8 @@ def build_version(pid: str, proj: dict, chip: dict, loader: dict | None, vdir: P
                    for name, address, image in images],
         'embedded': built['embedded'],
         **{k: (hex32(v) if k == 'flash_size' else v) for k, v in built['extra'].items()},
+        'release_txt': {'url': f'{base}/release.txt', 'size': len(release_txt), 'crc32': hex32(crc32(release_txt)),
+                        'sha256': hashlib.sha256(release_txt).hexdigest()},
         'fw_txt': {'url': f'{base}/fw.txt', 'size': len(fw_txt), 'crc32': hex32(crc32(fw_txt)),
                    'sha256': hashlib.sha256(fw_txt).hexdigest()},
         'sd_zip': {'url': f'{base}/{zip_name}', 'size': len(sd_zip),
@@ -448,9 +515,10 @@ def make_latest_txt(pid: str, chip_id: str, v: dict) -> bytes:
     """Device-facing summary in fw.txt's key=value style.
 
     Download base + each file into staging, check size/CRC32/SHA-256, then publish.
-    fw.txt is listed last: write it last so an interrupted copy is never a selectable project.
+    The file= order is the SD write order: images, release.txt, then fw.txt last so an
+    interrupted copy is never a selectable project. The number of file= lines is not fixed.
     """
-    files = [*v['images'], {'name': 'fw.txt', **v['fw_txt']}]
+    files = [*v['images'], {'name': 'release.txt', **v['release_txt']}, {'name': 'fw.txt', **v['fw_txt']}]
     return (f'schema={SCHEMA}\n'
             f'id={pid}\n'
             f'chip={chip_id}\n'
@@ -473,13 +541,13 @@ def chip_entry(c: dict) -> dict:
 
 
 def build(reg: Path, generated: str) -> tuple[dict, dict[str, bytes], list[str]]:
-    errors: list[str] = []
     out_files: dict[str, bytes] = {}
     try:
         chips = load_chips(reg)
         loaders = load_loaders(reg)
     except (RegistryError, OSError) as e:
         return {}, {}, [str(e)]
+    errors = check_devices(chips)
     for c in chips.values():
         if c['kind'] == 'stm32' and c['loader'] not in loaders:
             errors.append(f'chip {c["id"]}: unknown loader {c["loader"]}')

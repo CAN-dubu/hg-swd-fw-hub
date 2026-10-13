@@ -37,7 +37,7 @@
   <main id="app" class="wrap" aria-live="polite" aria-busy="true">
     <div class="skeleton" aria-label="불러오는 중">
       <div class="sk-hero"><div><div class="sk sk-title"></div><div class="sk sk-line"></div></div><div class="sk-stats"><div class="sk sk-stat"></div><div class="sk sk-stat"></div></div></div>
-      <div class="sk-shelf"><div class="sk sk-head"></div><div class="sk sk-card"></div><div class="sk sk-card"></div></div>
+      <div class="sk-shelf"><div class="sk sk-card"></div><div class="sk sk-card"></div></div>
     </div>
   </main>
   <div id="toasts" aria-live="polite"></div>
@@ -55,26 +55,33 @@
         <ol class="steps">
           <li><b>SD 패키지(zip)</b>를 받아 <code>prog</code> 폴더를 카드 루트에 풉니다. 같은 프로젝트의 이전 버전은 덮어씁니다.</li>
           <li><b>STM32(H723) 프로젝트</b>는 카드에 로더가 있어야 합니다. 없다면 아래 로더 파일을 직접 복사합니다. ST 라이선스 때문에 패키지에 포함하지 않습니다. <b>ESP 프로젝트</b>는 로더가 필요 없습니다.</li>
-          <li>카드를 프로그래머에 꽂고 메뉴(M)의 <b>Flash</b>에서 프로젝트를 고릅니다. 반복 작업은 <b>Auto setup</b>에서 칩별 프로젝트를 지정해 두고 대기 화면에서 SEL만 누릅니다.</li>
+          <li>카드를 프로그래머에 꽂고 메뉴(M) → <b>Manual → Flash</b>에서 프로젝트를 고릅니다. 반복 작업은 <b>Auto setup</b>에서 칩별 프로젝트를 지정해 두고 대기 화면에서 SEL만 누릅니다.</li>
           <li>확인 화면에서 SEL을 놓았다가 1초 누릅니다. <code>Verified</code>가 표시되면 완료입니다.</li>
+          <li>카드에 든 패키지는 메뉴(M) → <b>Storage → Installed bin</b>에서 칩별로 확인합니다.</li>
         </ol>
         <pre class="tree">/prog/
 ├── loaders/
 │   └── st/
 │       └── 0x483.stldr     <span>← 직접 복사</span>
-├── fw/
+├── fw/                     <span>← 전체 16개까지</span>
 │   ├── &lt;STM32 프로젝트&gt;/
-│   │   ├── fw.txt
-│   │   └── app.bin
+│   │   ├── app.bin
+│   │   ├── release.txt     <span>← 칩·버전</span>
+│   │   └── fw.txt
 │   └── &lt;ESP 프로젝트&gt;/
-│       ├── fw.txt
 │       ├── bootloader.bin
 │       ├── partitions.bin
 │       ├── ota-reset.bin
-│       └── firmware.bin
+│       ├── firmware.bin
+│       ├── release.txt
+│       └── fw.txt
 ├── auto0.cfg / auto1.cfg <span>← 프로그래머가 관리</span>
 └── README.txt</pre>
       </div>
+      <ul class="sd-notes">
+        <li><b>SD에는 칩 구분 없이 최대 16개까지</b> 둘 수 있습니다. 넘으면 프로젝트 ID 알파벳순으로 앞의 16개만 표시되고, <b>Installed bin</b>에 <code>16+</code>가 표시됩니다.</li>
+        <li><b>Storage → SD Delete</b>는 포맷이 아니라 카드의 모든 파일과 폴더를 지웁니다. <code>/prog/loaders/st/0x483.stldr</code>도 지워지므로 STM32 프로젝트를 쓰려면 아래 로더를 다시 복사하세요.</li>
+      </ul>
       <h2>로더</h2>
       <div id="loaders"></div>
     </section>
@@ -87,7 +94,7 @@
       <div class="endpoints">
         <article class="endpoint">
           <header><span class="method">GET</span><code data-url="fw/&lt;id&gt;/latest.txt"></code></header>
-          <p>프로젝트의 최신 정식 버전입니다. 프리릴리스는 제외됩니다. <code>fw.txt</code>와 같은 <code>key=value</code> 형식입니다. <code>file=이름,크기,CRC32,SHA-256</code> 줄마다 <code>base</code> + 이름으로 받습니다. STM32는 파일 2개, ESP는 5개이며, <code>fw.txt</code>가 항상 마지막입니다.</p>
+          <p>프로젝트의 최신 정식 버전입니다. 프리릴리스는 제외됩니다. <code>fw.txt</code>와 같은 <code>key=value</code> 형식입니다. <code>file=이름,크기,CRC32,SHA-256</code> 줄마다 <code>base</code> + 이름으로 받아 적힌 순서대로 SD에 씁니다. 줄 수는 칩과 버전마다 다르며, <code>release.txt</code>(칩·버전)와 <code>fw.txt</code>가 항상 마지막 두 줄입니다.</p>
           <pre id="latest-sample" class="code"></pre>
         </article>
         <article class="endpoint">

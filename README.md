@@ -15,6 +15,7 @@
 registry/
 ├── chips/<chip>.toml          칩. kind = "stm32"(device, 로더, Flash 범위, SP RAM 범위)
 │                              또는 "esp"(device, 이미지 칩 ID, 부트로더 주소)
+│                              device가 같은 칩끼리는 shared_device 규칙 (아래 검사 항목)
 ├── loaders/<loader>.toml      STM32 Flash 로더 지문(크기, CRC32, SHA-256). 파일은 배포하지 않음
 └── firmware/<id>/             프로젝트 = SD의 /prog/fw/<id>/
     ├── project.toml
@@ -46,25 +47,58 @@ web/                           정적 UI (manifest.json 렌더링, upload.js = �
 | `fw/<id>/latest.txt` | 최신 정식 버전 요약. `fw.txt`처럼 `key=value` 형식 |
 | `fw/<id>/<ver>/<image>` | 이미지. STM32는 `app.bin`, ESP는 `bootloader.bin`, `partitions.bin`, `firmware.bin`과 생성된 `ota-reset.bin` |
 | `fw/<id>/<ver>/fw.txt` | 프로그래머가 읽는 매니페스트. HG-SWD-PROG의 `prepare_h723_sd.py` / `prepare_esp_sd.py` 출력과 바이트 단위로 같음 |
+| `fw/<id>/<ver>/release.txt` | 칩·버전 정보. 기기가 `fw.txt`만으로는 알 수 없는 값 |
 | `fw/<id>/<ver>/<id>-<ver>-sd.zip` | `prog/` 폴더째 SD 루트에 푸는 패키지 |
 
 `latest.txt` 예(ESP):
 
 ```ini
 schema=1
-id=esp32s3-rly4-pro
+id=hg-esp32-s3-rly4pro
 chip=esp32s3
 version=1.0.0
-date=2026-10-07
-base=fw/esp32s3-rly4-pro/1.0.0/
+date=2026-10-13
+base=fw/hg-esp32-s3-rly4pro/1.0.0/
 file=bootloader.bin,19984,0x6AA603B4,b41be55a…
 file=partitions.bin,3072,0xF03E088A,ace02503…
 file=ota-reset.bin,8192,0xB4293435,7d2c7ac4…
 file=firmware.bin,367024,0x86B519A4,e271109b…
-file=fw.txt,287,0xE8476B59,8febb699…
+file=release.txt,75,0xE67D227D,66937476…
+file=fw.txt,287,0x77430E3E,7e78d13c…
 ```
 
-`file=이름,크기,CRC32,SHA-256` 줄마다 `base` + 이름으로 받습니다. STM32는 `app.bin`과 `fw.txt` 두 줄입니다. **`fw.txt`는 항상 마지막 줄이고, SD에도 마지막에 씁니다.** 그래야 중간에 끊긴 복사본이 선택 가능한 프로젝트로 보이지 않습니다. 경로는 사이트 루트 기준이고, 게시한 버전 폴더는 바꾸지 않습니다. `schema` 값이 바뀌면 호환되지 않는 변경입니다.
+`file=이름,크기,CRC32,SHA-256` 줄마다 `base` + 이름으로 받아 **적힌 순서대로** SD에 씁니다. 줄 수는 칩과 버전마다 다르므로 세지 말고 끝까지 읽습니다. **`release.txt`와 `fw.txt`가 항상 마지막 두 줄이고, `fw.txt`는 SD에도 마지막에 씁니다.** 그래야 중간에 끊긴 복사본이 선택 가능한 프로젝트로 보이지 않습니다. 경로는 사이트 루트 기준입니다. `schema` 값이 바뀌면 호환되지 않는 변경이고, 키나 `file=` 줄이 늘어나는 것은 호환되는 변경입니다. 모르는 키는 무시합니다.
+
+### release.txt
+
+SD 패키지의 `prog/fw/<id>/release.txt`와 사이트의 같은 파일은 내용이 같습니다. 형식은 `latest.txt`의 앞부분과 같은 `key=value`이고, CI는 줄 끝을 LF로 씁니다.
+
+```ini
+schema=1
+id=hg-esp32-s3
+chip=esp32s3            # registry/chips/<chip>.toml의 파일 이름
+version=1.0.0           # x.y.z 또는 x.y.z-tag
+date=2026-10-12
+```
+
+기기의 해석 규칙(HG-SWD-PROG는 이대로 구현합니다):
+
+- 모르는 키, `#`으로 시작하는 줄, 빈 줄은 무시합니다. 줄 끝은 CRLF와 LF를 모두 허용하고, 키와 값의 앞뒤 공백은 잘라 냅니다.
+- 파일이 1 KiB를 넘거나, `schema`가 `1`이 아니거나, 같은 키가 두 번 나오면 `release.txt`가 없는 것으로 취급합니다.
+- `version`은 `x.y.z` 또는 `x.y.z-tag` 형식이고 31자 이하일 때만 표시합니다. `id`는 참고용이며 폴더 이름과 달라도 됩니다.
+- `release.txt`는 표시와 칩 구분에만 씁니다. 기록할지와 무엇을 기록할지는 `fw.txt`가 정합니다.
+- `chip=`이 가리키는 칩의 device 문자열이 `fw.txt`의 `device=`와 같을 때만 `chip=`을 믿습니다. 다르거나 기기가 모르는 칩이면 Unknown으로 분류되며 기록할 수 없습니다.
+- `release.txt`가 없으면 `device=`로 판단하며, 그 device 그룹에서 `shared_device`가 없는 칩으로 분류합니다.
+
+`fw.txt`에 키를 더하지 않고 파일을 따로 두는 이유: 기기의 `fw.txt` 파서(`prog_inspect.c`, `esp_project.c`)가 모르는 키를 거부합니다. 반면 패키지 목록(`prog_catalog.c`)은 `fw.txt`와 거기 적힌 BIN만 읽으므로, 이미 배포된 프로그래머는 `release.txt`를 무시합니다.
+
+### SD카드에 둘 수 있는 개수
+
+SD에는 칩 구분 없이 최대 16개까지 둘 수 있습니다. 넘으면 프로젝트 ID 알파벳순으로 앞의 16개만 표시되고, Installed bin에 16+가 표시됩니다.
+
+### 게시한 버전의 불변 범위
+
+게시한 버전에서 바꾸지 않는 것은 **기기에 기록되는 바이트**, 곧 이미지 파일과 `fw.txt`입니다. 레지스트리의 버전 폴더(`registry/firmware/<id>/<ver>/`)도 고치지 않습니다. 반면 SD zip, zip 안의 `README.txt`, `release.txt`, `latest.txt`는 레지스트리에서 매번 다시 만드는 포장물입니다. 패키지 형식이 바뀌면 이전 버전 것도 다시 만들어지며, 이때 `manifest.json`의 `sd_zip.sha256`도 바뀝니다.
 
 ## 검사 항목
 
@@ -75,6 +109,9 @@ file=fw.txt,287,0xE8476B59,8febb699…
 - 프로젝트 ID: `A-Z a-z 0-9 _ -` 1~24자
 - 이름: 출력 가능한 ASCII 1~47자. `fw.txt`는 1,024바이트 이하
 - 버전 폴더: `x.y.z` 또는 `x.y.z-tag`. 태그가 붙은 버전은 프리릴리스이며 `latest`에서 제외
+- 칩 `device`: 기기는 `fw.txt`의 `device=`를 정확히 같은 문자열로 비교해서 칩을 고릅니다(`prog_target.c`). 나중에 추가한 칩이 기존 칩과 device 문자열을 같이 쓰면, 그 칩에만 `shared_device = true`를 넣습니다. 뜻은 "`release.txt`의 `chip=`이 있어야만 이 칩으로 인식된다"입니다.
+  - device 문자열이 같은 칩 그룹마다 `shared_device`가 없는 칩이 정확히 1개여야 함. `release.txt`가 없는 패키지는 이 칩으로 분류되기 때문입니다. 공유할 칩이 없는데 `shared_device`를 넣어도 오류
+  - `shared_device` 칩의 SD 패키지에는 `release.txt`가 반드시 있어야 함
 
 STM32
 

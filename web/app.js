@@ -1,7 +1,7 @@
 'use strict';
 
 const app = document.getElementById('app');
-const state = { manifest: null, query: '', chip: '', fresh: new Set(), checkedAt: 0, refreshing: false };
+const state = { manifest: null, query: '', chip: '', open: '', fresh: new Set(), checkedAt: 0, refreshing: false };
 
 function h(tag, attrs, ...children) {
   const el = document.createElement(tag);
@@ -48,15 +48,15 @@ const copyBtn = (text, label = '복사') =>
 const chipOf = (id) => state.manifest.chips.find((c) => c.id === id) || { id, name: id };
 const loaderOf = (id) => state.manifest.loaders.find((l) => l.id === id);
 
-const stop = (e) => e.stopPropagation();
 const eraseText = (v) => `${v.erase.count} × ${fmtSize(v.erase.unit)}`;
 
-function downloads(v, compact) {
-  return h('div', { class: 'dl' },
-    h('a', { class: 'btn primary', href: v.sd_zip.url, download: '', onclick: stop },
-      compact ? 'SD 패키지' : `SD 패키지 (${fmtSize(v.sd_zip.size)})`),
-    v.images.length === 1 ? h('a', { class: 'btn', href: v.images[0].url, download: '', onclick: stop }, 'BIN') : null,
-    h('a', { class: 'btn', href: v.fw_txt.url, download: '', onclick: stop }, 'fw.txt'));
+/* 파일 모양 아이콘. 칩 종류 색은 바깥의 --k를 따른다. 고정 문자열만 넣는다 */
+function fileIcon(kind, cls = 'fw-ico') {
+  const s = h('span', { class: `${cls} k-${kind}`, 'aria-hidden': 'true' });
+  s.innerHTML = '<svg viewBox="0 0 44 52"><path class="doc" d="M7 1.5h21l14.5 14.5v29A5.5 5.5 0 0 1 37 50.5H7A5.5 5.5 0 0 1 1.5 45V7A5.5 5.5 0 0 1 7 1.5z"/>' +
+    '<path class="fold" d="M28 1.5V11a5 5 0 0 0 5 5h9.5"/><rect class="band" x="1.5" y="29" width="29" height="13" rx="3"/>' +
+    '<text x="16" y="38.6">BIN</text></svg>';
+  return s;
 }
 
 /* ---------- 표시 도우미 ---------- */
@@ -112,7 +112,7 @@ function renderList() {
       (!state.chip || p.chip === state.chip) &&
       (!q || [p.id, p.name, p.description, chipOf(p.chip).name].join(' ').toLowerCase().includes(q))).sort(byRecent);
     pills.forEach((b) => { const on = b.dataset.chip === state.chip; b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on)); });
-    // 칩마다 한 줄: 최근에 바뀐 칩이 위로
+    // 칩마다 한 칸: 최근에 바뀐 칩이 앞으로
     const shelves = chipsInUse.map((c) => [c, list.filter((p) => p.chip === c.id)]).filter(([, ps]) => ps.length)
       .sort(([, a], [, b]) => byRecent(a[0], b[0]));
     // 처음엔 하나씩 떠오르고, 필터를 바꿀 때는 짧게 페이드만 한다
@@ -124,6 +124,7 @@ function renderList() {
           h('p', {}, '조건에 맞는 펌웨어가 없습니다.'),
           h('button', { type: 'button', class: 'btn', onclick: () => { state.query = ''; state.chip = ''; search.value = ''; refresh(); } }, '필터 초기화')));
     first = false;
+    placePeek(false);
   }
 
   const body = m.projects.length === 0
@@ -151,7 +152,7 @@ function renderList() {
     h('section', { class: 'hero' },
       h('div', { class: 'hero-text' },
         h('h1', {}, '펌웨어 저장소'),
-        h('p', { class: 'lead' }, 'SD 패키지를 받아 카드에 풀면 바로 기록할 수 있습니다.')),
+        h('p', { class: 'lead' }, '파일을 누르면 요약이 펼쳐집니다. SD 패키지를 받아 카드에 풀면 바로 기록할 수 있습니다.')),
       h('div', { class: 'stats' }, stats.map((s) => h('div', { class: 'stat' }, icon(s.ico, 'stat-ico'), s.n, h('span', { class: 'stat-label' }, s.label))))),
     m.projects.length ? h('div', { class: 'toolbar' },
       h('div', { class: 'search-wrap' }, search, h('kbd', { class: 'kbd', title: '/ 키로 검색' }, '/')),
@@ -164,33 +165,75 @@ function renderList() {
   if (m.projects.length) refresh();
 }
 
-/* 칩 한 줄: 왼쪽에 칩, 오른쪽에 그 칩의 펌웨어 카드 */
+/* 칩 한 칸: 펌웨어는 이름만 단 파일 아이콘으로 늘어놓고, 누르면 그 줄 아래에 요약을 펼친다 */
 function shelf(chip, projects, anim, nextI) {
   const kind = kindOf(chip);
-  return h('section', { class: `shelf k-${kind}` },
-    h('header', { class: `shelf-head ${anim}`, style: `--i:${Math.min(nextI(), 12)}` },
+  return h('section', { class: `shelf k-${kind} ${anim}`, style: `--i:${Math.min(nextI(), 12)}` },
+    h('header', { class: 'shelf-head' },
       icon('chip', 'shelf-ico'),
-      h('div', { class: 'shelf-title' }, h('h2', {}, chip.name), h('span', {}, `${IFACE[kind]} · ${projects.length}개`))),
-    h('div', { class: 'shelf-cards' }, projects.map((p) => card(p, anim, nextI()))));
+      h('h2', {}, chip.name),
+      h('span', { class: 'shelf-sub' }, IFACE[kind]),
+      h('span', { class: 'shelf-n', title: `프로젝트 ${projects.length}개` }, projects.length)),
+    h('div', { class: 'fw-grid' }, projects.map((p) => fileTile(p, kind, anim, nextI()))));
 }
 
-function card(p, anim, i) {
-  const v = p.versions.find((x) => x.version === p.latest);
-  const go = () => { location.hash = `#/p/${p.id}`; };
+function fileTile(p, kind, anim, i) {
   const fresh = state.fresh.has(p.id);
-  return h('article', {
-    class: `card ${anim}${fresh ? ' fresh' : ''}`, style: `--i:${Math.min(i, 12)}`, tabindex: '0', title: `${p.name} 자세히 보기`,
-    onclick: go, onkeydown: (e) => { if (e.key === 'Enter') go(); },
+  const recent = fresh || daysAgo(p.updated) < 7;
+  return h('button', {
+    type: 'button', class: `fw ${anim}${fresh ? ' fresh' : ''}`, style: `--i:${Math.min(i, 12)}`,
+    'data-id': p.id, 'aria-expanded': 'false', title: p.name,
+    onclick: () => { state.open = state.open === p.id ? '' : p.id; placePeek(true); },
   },
-    h('h3', {}, p.name,
-      fresh ? h('span', { class: 'tag ok pop' }, '방금 반영') : daysAgo(p.updated) < 7 ? h('span', { class: 'tag new' }, 'NEW') : null),
-    p.description ? h('p', { class: 'desc' }, p.description) : null,
-    h('div', { class: 'card-foot' },
-      h('span', { class: 'ver' }, `v${p.latest}`),
-      h('span', { class: 'when', title: v.date }, relDate(v.date)),
-      h('a', { class: 'btn primary sd-btn', href: v.sd_zip.url, download: '', onclick: stop, title: `SD 패키지 ${fmtSize(v.sd_zip.size)}` },
-        icon('download'), 'SD 패키지')),
-    icon('chevron', 'card-go'));
+    h('span', { class: 'fw-ico-wrap' }, fileIcon(kind),
+      recent ? h('span', { class: 'fw-new', title: fresh ? '방금 반영' : '최근 7일 안에 업데이트' }) : null),
+    h('span', { class: 'fw-name' }, p.name));
+}
+
+/* 고른 파일이 있는 줄 바로 뒤에 요약을 끼운다. 한 줄에 놓이는 개수는 화면 폭에 따라 바뀌므로 매번 다시 찾는다 */
+function placePeek(scroll) {
+  app.querySelector('.peek')?.remove();
+  let tile = null;
+  for (const t of app.querySelectorAll('.fw')) {
+    const on = t.dataset.id === state.open;
+    t.classList.toggle('open', on);
+    t.setAttribute('aria-expanded', String(on));
+    if (on) tile = t;
+  }
+  const p = tile && state.manifest.projects.find((x) => x.id === state.open);
+  if (!p) return;
+  const row = [...tile.parentElement.children].filter((t) => t.offsetTop === tile.offsetTop);
+  const panel = peek(p);
+  row[row.length - 1].after(panel);
+  const grid = tile.parentElement.getBoundingClientRect();
+  const r = tile.getBoundingClientRect();
+  panel.style.setProperty('--x', `${r.left + r.width / 2 - grid.left}px`);
+  if (scroll) panel.scrollIntoView({ block: 'nearest', behavior: reduceMotion() ? 'auto' : 'smooth' });
+}
+
+function closePeek() {
+  const tile = app.querySelector('.fw.open');
+  state.open = '';
+  placePeek(false);
+  tile?.focus();
+}
+
+function peek(p) {
+  const v = p.versions.find((x) => x.version === p.latest);
+  const fact = (label, value, title) => h('div', {}, h('dt', {}, label), h('dd', { title }, value));
+  return h('div', { class: 'peek', role: 'region', 'aria-label': `${p.name} 요약` },
+    h('div', { class: 'peek-head' },
+      h('div', { class: 'peek-title' }, h('h3', {}, p.name), h('code', { class: 'pid' }, p.id)),
+      h('button', { type: 'button', class: 'peek-x', 'aria-label': '닫기', onclick: closePeek }, '✕')),
+    p.description ? h('p', { class: 'peek-desc' }, p.description) : null,
+    h('dl', { class: 'peek-facts' },
+      fact('버전', `v${v.version}`),
+      fact('업데이트', relDate(v.date), v.date),
+      fact('크기', fmtSize(v.size), `${v.size.toLocaleString()} B`),
+      fact('구성', `BIN ${v.images.length}개`)),
+    h('div', { class: 'peek-actions' },
+      h('a', { class: 'btn', href: `#/p/${p.id}` }, '상세 보기'),
+      h('a', { class: 'btn primary', href: v.sd_zip.url, download: '' }, icon('download'), `SD 패키지 · ${fmtSize(v.sd_zip.size)}`)));
 }
 
 /* ---------- 새로고침 ---------- */
@@ -255,8 +298,7 @@ async function refreshManifest({ silent = false } = {}) {
       toast(`✔ ${parts.join(' · ')}`, 'ok');
       setTimeout(() => {
         changed.forEach((id) => state.fresh.delete(id));
-        app.querySelectorAll('.card.fresh').forEach((c) => c.classList.remove('fresh'));
-        app.querySelectorAll('.card .tag.ok').forEach((t) => t.remove());
+        app.querySelectorAll('.fw.fresh').forEach((c) => c.classList.remove('fresh'));
       }, 6000);
     } else {
       updateStamp();
@@ -278,58 +320,67 @@ function renderProject(id, ver) {
   const v = p.versions.find((x) => x.version === (ver || p.latest));
   if (!v) return renderMissing(`버전 "${ver}"을 찾을 수 없습니다.`);
   const chip = chipOf(p.chip);
-  const isLatest = v.version === p.latest;
-
-  const fact = (k, val, extra, wide) => h('div', { class: wide ? 'fact wide' : 'fact' }, h('dt', {}, k), h('dd', {}, val, extra || null));
+  const kind = kindOf(chip);
+  const esp = kind === 'esp';
   const emb = v.embedded;
-  const esp = chip.kind === 'esp';
+  const embText = emb && ([emb.version, emb.name, emb.idf && `IDF ${emb.idf}`].filter(Boolean).join(' / ') || '-');
+  const verTags = (x) => [x.version === p.latest ? h('span', { class: 'tag ok' }, '최신') : null,
+    x.prerelease ? h('span', { class: 'tag warn' }, '프리릴리스') : null];
 
-  app.replaceChildren(
+  const kv = (label, value, { title, wide } = {}) =>
+    h('div', { class: wide ? 'kv wide' : 'kv' }, h('dt', {}, label), h('dd', { title }, value));
+  // 기기에 기록하는 BIN이 먼저, 패키지 설명 파일(release.txt, fw.txt)은 아래에 옅게
+  const texts = [v.release_txt && { name: 'release.txt', ...v.release_txt }, { name: 'fw.txt', ...v.fw_txt }].filter(Boolean);
+  const fileRow = (f, side) => h('tr', { class: side ? 'side' : null },
+    h('td', {}, h('a', { href: f.url, download: '' }, f.name)),
+    h('td', {}, f.address ? h('code', {}, f.address) : h('span', { class: 'muted' }, '—')),
+    h('td', { class: 'num' }, f.size.toLocaleString()),
+    h('td', {}, h('code', {}, f.crc32)),
+    h('td', {}, h('code', { class: 'hash-short', title: f.sha256 }, `${f.sha256.slice(0, 12)}…`), copyBtn(f.sha256)));
+  const th = (labels) => h('thead', {}, h('tr', {}, labels.map(([t, cls]) => h('th', { class: cls }, t))));
+
+  app.replaceChildren(...[
     h('a', { class: 'back', href: '#/' }, '← 목록'),
-    h('section', { class: 'detail-head' },
-      h('div', { class: 'card-top' }, chipBadge(chip), h('code', { class: 'pid' }, p.id)),
-      h('h1', {}, p.name),
-      p.description ? h('p', { class: 'lead' }, p.description) : null),
-    h('section', { class: 'panel' },
-      h('div', { class: 'panel-head' },
-        h('div', {},
-          h('span', { class: 'big-ver' }, `v${v.version}`),
-          isLatest ? h('span', { class: 'tag ok' }, '최신') : null,
-          v.prerelease ? h('span', { class: 'tag warn' }, '프리릴리스') : null,
-          h('span', { class: 'muted' }, ` · ${v.date}`)),
-        downloads(v, false)),
-      h('dl', { class: 'facts' },
-        fact('크기', `${fmtSize(v.size)} (${v.size.toLocaleString()} B)`),
-        fact('지울 영역', eraseText(v)),
-        esp ? fact('필요 Flash', fmtSize(parseInt(v.flash_size, 16))) : fact('방식', 'SWD · ST 로더'),
-        esp ? fact('UART 속도 상한', v.baud === 'auto' ? 'auto (921600부터)' : `${v.baud} bps`) : null,
-        emb ? fact(esp ? '앱 정보' : '내장 버전', [emb.version, emb.name, emb.idf && `IDF ${emb.idf}`].filter(Boolean).join(' / ') || '-') : null),
-      h('div', { class: 'table-wrap images' },
-        h('table', { class: 'versions' },
-          h('thead', {}, h('tr', {}, ['파일', '주소', '크기', 'CRC32', 'SHA-256'].map((t) => h('th', {}, t)))),
-          h('tbody', {}, v.images.map((i) => h('tr', {},
-            h('td', {}, h('a', { href: i.url, download: '' }, i.name)),
-            h('td', {}, h('code', {}, i.address)),
-            h('td', {}, i.size.toLocaleString()),
-            h('td', {}, h('code', {}, i.crc32)),
-            h('td', {}, h('code', { class: 'hash-short', title: i.sha256 }, i.sha256.slice(0, 16) + '…'), copyBtn(i.sha256))))))),
-      v.notes ? h('div', { class: 'notes' }, h('h3', {}, '변경 내용'), h('pre', {}, v.notes)) : null),
-    h('section', {},
-      h('h2', {}, '버전 기록'),
+    h('section', { class: `d-head k-${kind}` },
+      fileIcon(kind, 'fw-ico d-ico'),
+      h('div', { class: 'd-title' },
+        h('div', { class: 'd-meta' }, chipBadge(chip), h('code', { class: 'pid' }, p.id)),
+        h('h1', {}, p.name),
+        p.description ? h('p', { class: 'lead' }, p.description) : null),
+      h('div', { class: 'd-get' },
+        h('a', { class: 'btn primary d-sd', href: v.sd_zip.url, download: '' }, icon('download'), 'SD 패키지 받기'),
+        h('span', { class: 'd-get-sub' }, `v${v.version} · zip ${fmtSize(v.sd_zip.size)}`))),
+    h('dl', { class: 'kvs' },
+      kv('버전', [`v${v.version}`, ...verTags(v)]),
+      kv('날짜', v.date, { title: relDate(v.date) }),
+      kv('크기', fmtSize(v.size), { title: `${v.size.toLocaleString()} B` }),
+      kv('지울 영역', eraseText(v)),
+      esp ? kv('필요 Flash', fmtSize(parseInt(v.flash_size, 16))) : kv('기록 방식', 'SWD · ST 로더'),
+      esp ? kv('UART 상한', v.baud === 'auto' ? 'auto' : `${v.baud} bps`, { title: v.baud === 'auto' ? '921600부터 낮춰 가며 연결' : null }) : null,
+      emb ? kv(esp ? '앱 정보' : '내장 버전', embText, { title: embText, wide: true }) : null),
+    v.notes ? h('section', { class: 'd-sec' }, h('h2', {}, '변경 내용'), h('pre', { class: 'd-notes' }, v.notes)) : null,
+    h('section', { class: 'd-sec' },
+      h('h2', {}, '파일', h('span', { class: 'h-sub' }, `기록 BIN ${v.images.length}개 · SD 패키지에 모두 들어 있음`)),
       h('div', { class: 'table-wrap' },
         h('table', { class: 'versions' },
-          h('thead', {}, h('tr', {}, ['버전', '날짜', '크기', '구성', ''].map((t) => h('th', {}, t)))),
+          th([['파일'], ['주소'], ['크기 (B)', 'num'], ['CRC32'], ['SHA-256']]),
+          h('tbody', {}, v.images.map((i) => fileRow(i, false)), texts.map((t) => fileRow(t, true)))))),
+    p.versions.length > 1 ? h('section', { class: 'd-sec' },
+      h('h2', {}, '버전 기록', h('span', { class: 'h-sub' }, `${p.versions.length}개`)),
+      h('div', { class: 'table-wrap' },
+        h('table', { class: 'versions' },
+          th([['버전'], ['날짜'], ['크기', 'num'], ['']]),
           h('tbody', {}, p.versions.map((x) => h('tr', { class: x.version === v.version ? 'sel' : null },
-            h('td', {}, h('a', { href: `#/p/${p.id}/${x.version}` }, `v${x.version}`),
-              x.version === p.latest ? h('span', { class: 'tag ok' }, '최신') : null,
-              x.prerelease ? h('span', { class: 'tag warn' }, 'pre') : null),
+            h('td', {}, h('a', { href: `#/p/${p.id}/${x.version}` }, `v${x.version}`), verTags(x)),
             h('td', {}, x.date),
-            h('td', {}, fmtSize(x.size)),
-            h('td', {}, x.images.length === 1 ? h('code', {}, x.images[0].crc32) : `${x.images.length}개 이미지`),
-            h('td', { class: 'right' }, downloads(x, true)))))))),
-    h('section', {},
-      h('h2', {}, '기기 업데이트 경로'),
-      h('div', { class: 'endpoint-line' }, h('span', { class: 'method' }, 'GET'), h('code', {}, absUrl(p.latest_url)), copyBtn(absUrl(p.latest_url)))));
+            h('td', { class: 'num' }, fmtSize(x.size)),
+            h('td', { class: 'right' }, h('a', { class: 'btn dl-mini', href: x.sd_zip.url, download: '', title: 'SD 패키지' },
+              icon('download'), fmtSize(x.sd_zip.size))))))))) : null,
+    h('details', { class: 'd-api' },
+      h('summary', {}, '기기 업데이트 경로 (LTE)'),
+      h('p', {}, '프로그래머가 최신 정식 버전을 받을 때 읽는 파일입니다.'),
+      h('div', { class: 'endpoint-line' }, h('span', { class: 'method' }, 'GET'), h('code', {}, absUrl(p.latest_url)), copyBtn(absUrl(p.latest_url)))),
+  ].filter(Boolean));
 }
 
 function renderMissing(msg) {
@@ -404,7 +455,14 @@ async function init() {
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden && route()[0] !== 'upload' && Date.now() - state.checkedAt > 60000) refreshManifest({ silent: true });
   });
+  // 화면 폭이 바뀌면 한 줄의 파일 수가 바뀌므로 펼친 요약을 다시 놓는다
+  let resizing = 0;
+  window.addEventListener('resize', () => {
+    cancelAnimationFrame(resizing);
+    resizing = requestAnimationFrame(() => { if (state.open && app.querySelector('.peek')) placePeek(false); });
+  });
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && app.querySelector('.peek') && !document.querySelector('dialog[open]')) { closePeek(); return; }
     const search = app.querySelector('.search');
     if (e.key === '/' && search && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) {
       e.preventDefault();
