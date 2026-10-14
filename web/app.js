@@ -1,7 +1,8 @@
 'use strict';
 
 const app = document.getElementById('app');
-const state = { manifest: null, query: '', chip: '', open: '', fresh: new Set(), checkedAt: 0, refreshing: false };
+const state = { manifest: null, query: '', chip: '', open: '', fresh: new Set(), checkedAt: 0, refreshing: false,
+  folderIn: {}, drag: null, bump: '', swap: '' };
 
 function h(tag, attrs, ...children) {
   const el = document.createElement(tag);
@@ -94,9 +95,52 @@ function countUp(el, to) {
   requestAnimationFrame(tick);
 }
 
+/* ---------- 폴더: 칩마다 BIN을 묶어 두는 정리용. 이 브라우저에만 저장된다 ---------- */
+
+const FOLDER_KEY = 'hub-folders-v1';
+// list: 칩 → [{ id, name }], at: 프로젝트 ID → 폴더 ID
+const folders = (() => {
+  try {
+    const v = JSON.parse(localStorage.getItem(FOLDER_KEY));
+    if (v && typeof v.list === 'object' && typeof v.at === 'object') return v;
+  } catch { /* 무시 */ }
+  return { list: {}, at: {} };
+})();
+
+function saveFolders() {
+  try { localStorage.setItem(FOLDER_KEY, JSON.stringify(folders)); } catch { /* 저장 못 해도 이번 화면에서는 유지 */ }
+}
+
+const foldersOf = (chip) => folders.list[chip] || [];
+// 지워진 폴더를 가리키면 폴더 밖에 있는 것으로 본다
+const folderOf = (p) => (foldersOf(p.chip).some((f) => f.id === folders.at[p.id]) ? folders.at[p.id] : '');
+
+function addFolder(chip) {
+  const taken = new Set(foldersOf(chip).map((f) => f.name));
+  let name = '새 폴더';
+  for (let k = 2; taken.has(name); k++) name = `새 폴더 ${k}`;
+  const f = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), name };
+  (folders.list[chip] ||= []).push(f);
+  saveFolders();
+  return f;
+}
+
+function moveTo(id, folderId) {
+  if (folderId) folders.at[id] = folderId;
+  else delete folders.at[id];
+  saveFolders();
+}
+
+function removeFolder(chip, folderId) {
+  folders.list[chip] = foldersOf(chip).filter((f) => f.id !== folderId);
+  for (const [id, f] of Object.entries(folders.at)) if (f === folderId) delete folders.at[id];
+  saveFolders();
+}
+
 /* ---------- 목록 ---------- */
 
 const byRecent = (a, b) => b.updated.localeCompare(a.updated) || a.id.localeCompare(b.id);
+let relist = () => {};
 
 function renderList() {
   const m = state.manifest;
@@ -106,7 +150,8 @@ function renderList() {
   const pills = [];
   let first = true;
 
-  function refresh() {
+  // quiet: 폴더 정리처럼 화면 안에서 바뀔 때는 전체를 다시 띄우지 않는다
+  function refresh({ quiet = false } = {}) {
     const q = state.query.trim().toLowerCase();
     const list = m.projects.filter((p) =>
       (!state.chip || p.chip === state.chip) &&
@@ -117,15 +162,19 @@ function renderList() {
       .sort(([, a], [, b]) => byRecent(a[0], b[0]));
     // 처음엔 하나씩 떠오르고, 필터를 바꿀 때는 짧게 페이드만 한다
     let i = 0;
-    const anim = first ? 'rise' : 'fade';
+    const anim = quiet ? '' : first ? 'rise' : 'fade';
+    // 검색 중에는 폴더 안에 숨은 결과도 보이도록 폴더 없이 늘어놓는다
     results.replaceChildren(shelves.length
-      ? h('div', { class: 'shelves' }, shelves.map(([c, ps]) => shelf(c, ps, anim, () => i++)))
+      ? h('div', { class: 'shelves' }, shelves.map(([c, ps]) => shelf(c, ps, anim, () => i++, Boolean(q))))
       : h('div', { class: 'none fade' },
           h('p', {}, '조건에 맞는 펌웨어가 없습니다.'),
           h('button', { type: 'button', class: 'btn', onclick: () => { state.query = ''; state.chip = ''; search.value = ''; refresh(); } }, '필터 초기화')));
     first = false;
+    state.bump = '';
+    state.swap = '';
     placePeek(false);
   }
+  relist = refresh;
 
   const body = m.projects.length === 0
     ? h('div', { class: 'empty rise' },
@@ -152,7 +201,7 @@ function renderList() {
     h('section', { class: 'hero' },
       h('div', { class: 'hero-text' },
         h('h1', {}, '펌웨어 저장소'),
-        h('p', { class: 'lead' }, '파일을 누르면 요약이 펼쳐집니다. SD 패키지를 받아 카드에 풀면 바로 기록할 수 있습니다.')),
+        h('p', { class: 'lead' }, '파일을 누르면 요약이 열립니다. 파일을 끌어 폴더에 넣어 정리할 수 있고, 폴더는 이 브라우저에 저장됩니다.')),
       h('div', { class: 'stats' }, stats.map((s) => h('div', { class: 'stat' }, icon(s.ico, 'stat-ico'), s.n, h('span', { class: 'stat-label' }, s.label))))),
     m.projects.length ? h('div', { class: 'toolbar' },
       h('div', { class: 'search-wrap' }, search, h('kbd', { class: 'kbd', title: '/ 키로 검색' }, '/')),
@@ -165,36 +214,175 @@ function renderList() {
   if (m.projects.length) refresh();
 }
 
-/* 칩 한 칸: 펌웨어는 이름만 단 파일 아이콘으로 늘어놓고, 누르면 그 줄 아래에 요약을 펼친다 */
-function shelf(chip, projects, anim, nextI) {
+/* div를 버튼처럼 쓴다. <button>은 Firefox에서 끌기가 안 되고 안에 입력란을 둘 수 없다 */
+function activate(el, fn) {
+  el.addEventListener('click', fn);
+  el.addEventListener('keydown', (e) => {
+    if (e.target === el && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); fn(); }
+  });
+  return el;
+}
+
+/* 끌고 있는 파일을 받을 수 있는 곳. accept()가 거짓이면 놓을 수 없다 */
+function dropTarget(el, accept, onDrop) {
+  const ok = () => state.drag && accept(state.drag);
+  el.addEventListener('dragenter', (e) => { if (ok()) { e.preventDefault(); el.classList.add('over'); } });
+  el.addEventListener('dragover', (e) => { if (ok()) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; } });
+  el.addEventListener('dragleave', (e) => { if (!el.contains(e.relatedTarget)) el.classList.remove('over'); });
+  el.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const d = ok() && state.drag;
+    endDrag();
+    if (d) onDrop(d);
+  });
+  return el;
+}
+
+function endDrag() {
+  state.drag = null;
+  document.body.classList.remove('dragging');
+  app.querySelectorAll('.over, .lifted').forEach((el) => el.classList.remove('over', 'lifted'));
+}
+
+/* 폴더 아이콘 앞면에 든 파일 수를 적는다. 숫자만 넣는다 */
+function folderIcon(n) {
+  const s = h('span', { class: 'fw-ico fd-ico', 'aria-hidden': 'true' });
+  s.innerHTML = '<svg viewBox="0 0 52 52"><path class="back" d="M2.5 13A5 5 0 0 1 7.5 8h11.2a4 4 0 0 1 2.9 1.2l3.6 3.8h19.3a5 5 0 0 1 5 5v23.5a5 5 0 0 1-5 5H7.5a5 5 0 0 1-5-5z"/>' +
+    `<path class="front" d="M2.5 22a4 4 0 0 1 4-4h39a4 4 0 0 1 4 4v19.5a5 5 0 0 1-5 5H7.5a5 5 0 0 1-5-5z"/><text x="26" y="37">${Number(n) || ''}</text></svg>`;
+  return s;
+}
+
+/* 칩 한 칸: 폴더와 파일 아이콘을 늘어놓고, 파일을 누르면 그 아래에 작은 요약을 띄운다.
+   폴더를 누르면 그 칸이 폴더 안을 보여 준다 */
+function shelf(chip, projects, anim, nextI, flat) {
   const kind = kindOf(chip);
-  return h('section', { class: `shelf k-${kind} ${anim}`, style: `--i:${Math.min(nextI(), 12)}` },
-    h('header', { class: 'shelf-head' },
+  const fs = flat ? [] : foldersOf(chip.id);
+  const inside = fs.find((f) => f.id === state.folderIn[chip.id]) || null;
+  if (!flat && !inside) delete state.folderIn[chip.id];
+  const here = flat ? projects : projects.filter((p) => folderOf(p) === (inside ? inside.id : ''));
+  const sameChip = (d) => d.chip === chip.id;
+  const count = h('span', { class: 'shelf-n', title: `프로젝트 ${projects.length}개` }, projects.length);
+  const tool = (ico, label, onclick, cls = '') => h('button', { type: 'button', class: `tool ${cls}`, title: label, 'aria-label': label, onclick }, icon(ico));
+
+  let head;
+  if (inside) {
+    // 위치 표시의 칩 이름에 파일을 놓으면 폴더 밖으로 꺼낸다
+    const up = dropTarget(h('button', { type: 'button', class: 'crumb', title: '폴더 밖으로 (파일을 놓으면 꺼냄)', onclick: () => openFolder(chip.id, '') }, chip.name),
+      sameChip, (d) => { moveTo(d.id, ''); state.bump = d.id; openFolder(chip.id, ''); });
+    head = h('header', { class: 'shelf-head' },
+      icon('chip', 'shelf-ico'),
+      h('h2', { class: 'crumbs' }, up, h('span', { class: 'crumb-sep', 'aria-hidden': 'true' }, '›'), h('span', { class: 'crumb-here' }, inside.name)),
+      h('div', { class: 'shelf-tools' },
+        tool('pencil', '폴더 이름 바꾸기', (e) => renameFolder(e.currentTarget.closest('.shelf').querySelector('.crumb-here'), inside)),
+        tool('trash', '폴더 삭제 (파일은 밖으로)', () => {
+          const n = projects.filter((p) => folderOf(p) === inside.id).length;
+          removeFolder(chip.id, inside.id);
+          state.folderIn[chip.id] = '';
+          relist({ quiet: true });
+          toast(n ? `'${inside.name}' 폴더를 지우고 파일 ${n}개를 밖으로 옮겼습니다` : `'${inside.name}' 폴더를 지웠습니다`);
+        }, 'danger'),
+        count));
+  } else {
+    // 새 폴더 버튼에 파일을 놓으면 그 파일을 담은 폴더를 만든다
+    const add = flat ? null : dropTarget(tool('folder-plus', '새 폴더 (파일을 놓으면 담아서 만듦)', () => newFolder(chip.id), 'add'),
+      sameChip, (d) => newFolder(chip.id, d.id));
+    head = h('header', { class: 'shelf-head' },
       icon('chip', 'shelf-ico'),
       h('h2', {}, chip.name),
       h('span', { class: 'shelf-sub' }, IFACE[kind]),
-      h('span', { class: 'shelf-n', title: `프로젝트 ${projects.length}개` }, projects.length)),
-    h('div', { class: 'fw-grid' }, projects.map((p) => fileTile(p, kind, anim, nextI()))));
+      h('div', { class: 'shelf-tools' }, add, count));
+  }
+
+  return h('section', { class: `shelf k-${kind} ${anim}`, 'data-chip': chip.id, style: `--i:${Math.min(nextI(), 12)}` },
+    head,
+    h('div', { class: `fw-grid${state.swap === chip.id ? ' swap' : ''}` },
+      inside ? null : fs.map((f) => folderTile(chip.id, f, projects.filter((p) => folderOf(p) === f.id).length, anim, nextI())),
+      here.map((p) => fileTile(p, kind, anim, nextI())),
+      inside && !here.length ? h('p', { class: 'fd-empty' }, '빈 폴더입니다. 밖에서 파일을 이 폴더 아이콘으로 끌어다 놓으세요.') : null));
+}
+
+function openFolder(chip, folderId) {
+  const from = state.folderIn[chip] || '';
+  state.folderIn[chip] = folderId;
+  state.open = '';
+  state.swap = chip;
+  relist({ quiet: true });
+  // 들어가면 위치 표시로, 나오면 방금 있던 폴더로 포커스를 옮긴다
+  const box = app.querySelector(`.shelf[data-chip="${CSS.escape(chip)}"]`);
+  (folderId ? box?.querySelector('.crumb') : box?.querySelector(`[data-folder="${CSS.escape(from)}"]`))?.focus({ preventScroll: true });
+}
+
+/* 새 폴더를 만들고 바로 이름을 고치게 한다. id가 있으면 그 파일을 담는다 */
+function newFolder(chip, id) {
+  const f = addFolder(chip);
+  if (id) moveTo(id, f.id);
+  state.folderIn[chip] = '';
+  state.open = '';
+  state.bump = f.id;
+  relist({ quiet: true });
+  const tile = app.querySelector(`[data-folder="${CSS.escape(f.id)}"]`);
+  if (tile) renameFolder(tile.querySelector('.fw-name'), f);
+}
+
+function renameFolder(label, f) {
+  if (!label) return;
+  const input = h('input', { class: 'name-edit', value: f.name, maxlength: '40', 'aria-label': '폴더 이름' });
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    const name = input.value.trim();
+    if (save && name && name !== f.name) { f.name = name; saveFolders(); }
+    if (input.isConnected) relist({ quiet: true });
+  };
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') finish(true);
+    else if (e.key === 'Escape') finish(false);
+  });
+  input.addEventListener('blur', () => finish(true));
+  input.addEventListener('click', (e) => e.stopPropagation());
+  label.replaceWith(input);
+  input.focus();
+  input.select();
+}
+
+function folderTile(chip, f, n, anim, i) {
+  const t = h('div', {
+    class: `fw fd ${anim}${state.bump === f.id ? ' got' : ''}`, role: 'button', tabindex: '0', style: `--i:${Math.min(i, 12)}`,
+    'data-folder': f.id, title: f.name, 'aria-label': `${f.name} 폴더, 파일 ${n}개`,
+  }, folderIcon(n), h('span', { class: 'fw-name' }, f.name));
+  activate(t, () => openFolder(chip, f.id));
+  return dropTarget(t, (d) => d.chip === chip && d.from !== f.id, (d) => { moveTo(d.id, f.id); state.bump = f.id; relist({ quiet: true }); });
 }
 
 function fileTile(p, kind, anim, i) {
   const fresh = state.fresh.has(p.id);
   const recent = fresh || daysAgo(p.updated) < 7;
-  return h('button', {
-    type: 'button', class: `fw ${anim}${fresh ? ' fresh' : ''}`, style: `--i:${Math.min(i, 12)}`,
-    'data-id': p.id, 'aria-expanded': 'false', title: p.name,
-    onclick: () => { state.open = state.open === p.id ? '' : p.id; placePeek(true); },
+  const t = h('div', {
+    class: `fw ${anim}${fresh ? ' fresh' : ''}${state.bump === p.id ? ' got' : ''}`, role: 'button', tabindex: '0', draggable: 'true',
+    style: `--i:${Math.min(i, 12)}`, 'data-id': p.id, 'aria-expanded': 'false', title: p.name,
+    ondragstart: (e) => {
+      e.dataTransfer.setData('text/plain', p.name);
+      e.dataTransfer.effectAllowed = 'move';
+      state.drag = { id: p.id, chip: p.chip, from: folderOf(p) };
+      if (state.open) { state.open = ''; placePeek(false); }
+      // 끌기 이미지를 찍은 다음에 표시를 바꾼다
+      requestAnimationFrame(() => { if (state.drag) { document.body.classList.add('dragging'); t.classList.add('lifted'); } });
+    },
+    ondragend: endDrag,
   },
     h('span', { class: 'fw-ico-wrap' }, fileIcon(kind),
       recent ? h('span', { class: 'fw-new', title: fresh ? '방금 반영' : '최근 7일 안에 업데이트' }) : null),
     h('span', { class: 'fw-name' }, p.name));
+  return activate(t, () => { state.open = state.open === p.id ? '' : p.id; placePeek(true); });
 }
 
-/* 고른 파일이 있는 줄 바로 뒤에 요약을 끼운다. 한 줄에 놓이는 개수는 화면 폭에 따라 바뀌므로 매번 다시 찾는다 */
+/* 고른 파일 바로 아래에 작은 요약을 띄운다. 칸 밖으로 나가지 않게 좌우를 맞춘다 */
 function placePeek(scroll) {
   app.querySelector('.peek')?.remove();
   let tile = null;
-  for (const t of app.querySelectorAll('.fw')) {
+  for (const t of app.querySelectorAll('.fw[data-id]')) {
     const on = t.dataset.id === state.open;
     t.classList.toggle('open', on);
     t.setAttribute('aria-expanded', String(on));
@@ -202,38 +390,42 @@ function placePeek(scroll) {
   }
   const p = tile && state.manifest.projects.find((x) => x.id === state.open);
   if (!p) return;
-  const row = [...tile.parentElement.children].filter((t) => t.offsetTop === tile.offsetTop);
+  const grid = tile.parentElement;
   const panel = peek(p);
-  row[row.length - 1].after(panel);
-  const grid = tile.parentElement.getBoundingClientRect();
-  const r = tile.getBoundingClientRect();
-  panel.style.setProperty('--x', `${r.left + r.width / 2 - grid.left}px`);
+  grid.append(panel);
+  const center = tile.offsetLeft + tile.offsetWidth / 2;
+  const left = Math.max(0, Math.min(center - panel.offsetWidth / 2, grid.clientWidth - panel.offsetWidth));
+  panel.style.left = `${left}px`;
+  panel.style.top = `${tile.offsetTop + tile.offsetHeight + 8}px`;
+  panel.style.setProperty('--x', `${center - left}px`);
   if (scroll) panel.scrollIntoView({ block: 'nearest', behavior: reduceMotion() ? 'auto' : 'smooth' });
 }
 
-function closePeek() {
+function closePeek(focus = true) {
   const tile = app.querySelector('.fw.open');
   state.open = '';
   placePeek(false);
-  tile?.focus();
+  if (focus) tile?.focus();
 }
 
+/* 꼭 필요한 것만: 이름, 버전·크기·날짜 한 줄, 받기. 폴더가 있으면 옮기기 (끌 수 없는 터치 화면용) */
 function peek(p) {
   const v = p.versions.find((x) => x.version === p.latest);
-  const fact = (label, value, title) => h('div', {}, h('dt', {}, label), h('dd', { title }, value));
-  return h('div', { class: 'peek', role: 'region', 'aria-label': `${p.name} 요약` },
+  const fs = foldersOf(p.chip);
+  const dot = () => h('span', { class: 'dot', 'aria-hidden': 'true' }, '·');
+  return h('div', { class: 'peek', role: 'dialog', 'aria-label': `${p.name} 요약` },
     h('div', { class: 'peek-head' },
-      h('div', { class: 'peek-title' }, h('h3', {}, p.name), h('code', { class: 'pid' }, p.id)),
-      h('button', { type: 'button', class: 'peek-x', 'aria-label': '닫기', onclick: closePeek }, '✕')),
-    p.description ? h('p', { class: 'peek-desc' }, p.description) : null,
-    h('dl', { class: 'peek-facts' },
-      fact('버전', `v${v.version}`),
-      fact('업데이트', relDate(v.date), v.date),
-      fact('크기', fmtSize(v.size), `${v.size.toLocaleString()} B`),
-      fact('구성', `BIN ${v.images.length}개`)),
+      h('h3', { title: p.description || null }, p.name),
+      h('button', { type: 'button', class: 'peek-x', 'aria-label': '닫기', onclick: () => closePeek() }, '✕')),
+    h('p', { class: 'peek-meta' },
+      `v${v.version}`, dot(), h('span', { title: `${v.size.toLocaleString()} B` }, fmtSize(v.size)), dot(), h('span', { title: v.date }, relDate(v.date))),
     h('div', { class: 'peek-actions' },
-      h('a', { class: 'btn', href: `#/p/${p.id}` }, '상세 보기'),
-      h('a', { class: 'btn primary', href: v.sd_zip.url, download: '' }, icon('download'), `SD 패키지 · ${fmtSize(v.sd_zip.size)}`)));
+      h('a', { class: 'btn', href: `#/p/${p.id}` }, '상세'),
+      h('a', { class: 'btn primary', href: v.sd_zip.url, download: '', title: `SD 패키지 zip · ${fmtSize(v.sd_zip.size)}` }, icon('download'), 'SD 패키지')),
+    fs.length ? h('label', { class: 'peek-move', title: '폴더로 옮기기' }, icon('folder'),
+      h('select', { 'aria-label': '폴더로 옮기기', onchange: (e) => { moveTo(p.id, e.target.value); state.open = ''; state.bump = e.target.value || p.id; relist({ quiet: true }); } },
+        h('option', { value: '', selected: !folderOf(p) }, '폴더 밖'),
+        fs.map((f) => h('option', { value: f.id, selected: folderOf(p) === f.id }, f.name)))) : null);
 }
 
 /* ---------- 새로고침 ---------- */
@@ -462,6 +654,12 @@ async function init() {
     cancelAnimationFrame(resizing);
     resizing = requestAnimationFrame(() => { if (state.open && app.querySelector('.peek')) placePeek(false); });
   });
+  // 요약 밖을 누르면 닫는다
+  document.addEventListener('click', (e) => {
+    if (state.open && e.target.isConnected && !e.target.closest('.peek, .fw[data-id]')) closePeek(false);
+  });
+  // 끌던 파일이 다시 그려져 dragend를 못 받는 경우를 대비한다
+  document.addEventListener('dragend', endDrag);
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && app.querySelector('.peek') && !document.querySelector('dialog[open]')) { closePeek(); return; }
     const search = app.querySelector('.search');
