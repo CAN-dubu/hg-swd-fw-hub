@@ -1,0 +1,3 @@
+name        = "HG-ESP Devkit V4 TEST"
+chip        = "esp32"
+description = "V4 보드 테스트용 펌웨어"
