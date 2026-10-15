@@ -1,0 +1,29 @@
+HG-ESP Devkit V4 TEST (hg-espDev_v4) - third-party software notices
+
+Copyright (c) 2026 Higenis. This firmware image is built with Arduino-ESP32
+3.3.11 and includes the third-party software listed below. License texts named
+licenses/<file> are in prog/licenses/ of the SD package, licenses/ on the FW Hub
+site and registry/licenses/ in the repository.
+
+
+1. Arduino-ESP32 core 3.3.11
+   Copyright 2015-2026 Espressif Systems (Shanghai) PTE LTD and contributors
+   License: GNU Lesser General Public License v2.1 (licenses/LGPL-2.1.txt)
+   Source: https://github.com/espressif/arduino-esp32/tree/3.3.11
+
+2. ESP-IDF v5.5.5 (second stage bootloader, drivers and system components,
+   as prebuilt for Arduino by esp32-arduino-lib-builder)
+   Copyright Espressif Systems (Shanghai) CO LTD
+   License: Apache License 2.0 (licenses/Apache-2.0.txt)
+   Source: https://github.com/espressif/esp-idf/tree/v5.5.5
+
+3. FreeRTOS Kernel (ESP-IDF port)
+   Copyright (C) 2021 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
+   License: MIT (licenses/MIT.txt)
+
+4. Mbed TLS (ESP-IDF component)
+   Copyright The Mbed TLS Contributors
+   License: Apache License 2.0 (licenses/Apache-2.0.txt)
+
+5. newlib C library (Espressif toolchain)
+   License: various permissive licenses (licenses/newlib.txt)
